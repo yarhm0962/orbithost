@@ -552,14 +552,15 @@ if(RUNTIME==='process')recoverProcesses();
 app.get('/healthz',(req,res)=>res.json({ok:true,service:'orbithost-worker',bootId:BOOT_ID,runtime:RUNTIME}));
 app.use('/v1',auth);
 app.get('/v1/healthz',(req,res)=>res.json({ok:true,service:'orbithost-worker',authenticated:true,bootId:BOOT_ID,runtime:RUNTIME}));
-app.post('/v1/deploy',upload.single('bundle'),async(req,res)=>{
+const deployHandler=async(req,res)=>{
   try{const result=await deployImpl(req.body,req.file);res.json(result)}catch(error){
     const id=String(req.body?.projectId||'');const oldSecrets=getSecrets(id);const incomingEnv=validateSecretsForRedaction(req.body?.envJson);const secrets=allSecretValues(oldSecrets,incomingEnv);
     if(validId(id))appendBuild(id,`\n[deployment error] ${redact(error.message,secrets)}\n`,secrets);
     const msg=/exit|docker|git|pip|build|clone|ZIP|repository|environment|variable|command|Python/i.test(error.message)?redact(error.message,secrets): 'Deployment failed. Check the worker build logs.';
     res.status(400).json({error:msg});
-  }finally{if(req.file?.path)await fs.promises.rm(req.file.path,{force:true}).catch(()=>{})}
-});
+  }};
+app.post('/v1/deploy',upload.single('bundle'),(req,res)=>{if(req.body&&!req.body.projectId&&req.params&&req.params.id)req.body.projectId=req.params.id;return deployHandler(req,res)});
+app.post('/v1/projects/:id/deploy',upload.single('bundle'),(req,res)=>{req.body=req.body||{};if(!req.body.projectId)req.body.projectId=req.params.id;return deployHandler(req,res)});
 app.post('/v1/projects/:id/action',async(req,res)=>{try{res.json(await actionImpl(req.params.id,req.body?.action))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/status',async(req,res)=>{try{res.json(await statusImpl(req.params.id))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/logs',async(req,res)=>{try{const stream=req.query.stream==='build'?'build':'runtime';res.json(await logsImpl(req.params.id,stream))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
