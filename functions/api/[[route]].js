@@ -656,7 +656,6 @@ async function handle(request, env, method, path, url, ip) {
 
     if (method === 'DELETE') {
       checkCsrf();
-      if (p.status === 'deploying' || projectOperations.has(p.id)) return json({ error: 'A project cannot be deleted while an operation is running.' }, 409);
       projectOperations.add(p.id);
       try {
         await workerRequest(env, `/v1/projects/${p.id}/action`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'delete' }) });
@@ -733,6 +732,8 @@ async function handle(request, env, method, path, url, ip) {
     projectOperations.add(p.id);
     try {
       const result = await deployWithWorker(env, p, deployment.id);
+      const still = await first(env.DB.prepare('SELECT id FROM projects WHERE id=?').bind(p.id));
+      if (!still) return json({ error: 'Project was deleted during its deployment.' }, 409);
       let runtimeStatus = 'unknown';
       try {
         const measured = await workerRequest(env, `/v1/projects/${p.id}/status`, {}, 15000);
@@ -755,6 +756,8 @@ async function handle(request, env, method, path, url, ip) {
         message: result?.message || message
       });
     } catch (error) {
+      const gone = await first(env.DB.prepare('SELECT id FROM projects WHERE id=?').bind(p.id));
+      if (!gone) return json({ error: 'Project was deleted during its deployment.' }, 409);
       const duration = Date.now() - started;
       const aes = await aesKey(env);
       const secrets = aes ? (await readEnv(env, p.id, aes)).map((x) => x.value) : [];

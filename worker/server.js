@@ -466,12 +466,14 @@ async function deployProcess(body,file){
   }
   if(buildCommand){log('[OrbitHost worker] Running build command…\n');await loggedRun(id,'/bin/sh',['-c',buildCommand],env,{cwd:dir,timeout:BUILD_TIMEOUT_MS})}
   await stopProcess(id,10000);
+  if(deletedProjects.has(id))throw new Error('Deployment aborted: the project was deleted while this deployment was running.');
   await fs.promises.writeFile(secretPath(id),encrypt(env),{mode:0o600});
   writeMeta(id,{startCommand,buildCommand,pythonVersion:version,autoStart:true,reqHash});
   fs.mkdirSync(path.join(DATA,`botdata-${id}`),{recursive:true,mode:0o700});
   log('\n[OrbitHost worker] Starting process…\n');
   await spawnBot(id,env);
   await new Promise(r=>setTimeout(r,2500));
+  if(deletedProjects.has(id))throw new Error('Deployment aborted: the project was deleted while this deployment was running.');
   if(!procs.has(id)){
     log('[OrbitHost worker] The start process exited immediately after start; marking this deployment failed.\n');
     const failedMeta=readMeta(id);
@@ -485,6 +487,7 @@ async function containerActionProcess(id,action){
   if(!validId(id))throw new Error('Invalid project ID.');
   const secrets=getSecrets(id);
   if(action==='delete'){
+    deletedProjects.add(id);
     await stopProcess(id,6000).catch(()=>{});
     procs.delete(id);
     await fs.promises.rm(projectPath(id),{recursive:true,force:true});
@@ -659,6 +662,7 @@ async function restoreFromControlPlane(){
     console.log(`[OrbitHost worker] Boot restore complete: ${restored} project(s) restored, ${started} started.`);
 }
 const activeDeploys=new Set();
+const deletedProjects=new Set();
 const restartBackoff=new Map();
 const watchdogState={sweeps:0,lastSweepAt:null,restarts:[]};
 async function watchdogSweep(){
@@ -667,7 +671,7 @@ async function watchdogSweep(){
   try{dirs=fs.readdirSync(PROJECTS,{withFileTypes:true}).filter(d=>d.isDirectory()).map(d=>d.name)}catch{return}
   for(const id of dirs){
     if(!validId(id))continue;
-    if(activeDeploys.has(id))continue;
+    if(activeDeploys.has(id)||deletedProjects.has(id))continue;
     if(procs.has(id)){restartBackoff.delete(id);continue}
     const meta=readMeta(id);
     if(!meta||!meta.startCommand||meta.autoStart===false)continue;

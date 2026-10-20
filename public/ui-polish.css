@@ -546,3 +546,21 @@ button, .button, .icon-button, .select, .field-input, .nav-item, .tab, .project-
   .modal { width: 100%; max-width: calc(100vw - 16px); }
   .button-primary { box-shadow: 0 6px 16px -8px rgba(137, 120, 255, .5); }
 }
+
+/*
+ * Layer 4: small-phone hardening (360px class devices, Oppo A18 etc.)
+ * The hero row and the action row must never share one flex line at this
+ * width: sharing it starves the project hero and squeezes the subtitle
+ * into one word per line with the back button overlapping it.
+ */
+@media (max-width: 480px) {
+  .page-heading { flex-wrap: wrap; }
+  .page-heading[style] { align-items: stretch; }
+  .project-hero { flex: 1 1 100%; min-width: 0; }
+  .project-hero > div:not(.back-link):not(.project-avatar) { min-width: 0; }
+  .hero-actions { flex: 1 1 100%; width: 100%; gap: 7px; }
+  .hero-actions .button { flex: 1 1 auto; min-height: 44px; min-width: 44px; }
+  .page-subtitle { overflow-wrap: anywhere; }
+  .project-tabs { -webkit-overflow-scrolling: touch; scroll-padding-inline: 12px; }
+  .project-tab:first-child { padding-left: 2px; }
+}
