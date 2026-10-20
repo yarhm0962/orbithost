@@ -595,10 +595,10 @@ async function restoreFromControlPlane(){
   for(let attempt=1;attempt<=3&&!data;attempt++){
     if(attempt>1)await new Promise(r=>setTimeout(r,20000));
     try{
-      const res=await fetch(`${base}/internal/worker/restore`,{headers:{authorization:`Bearer ${token}`},signal:AbortSignal.timeout(30000)});
-      if(!res.ok){fetchError=`control plane responded ${res.status}`;restoreState.attempts.push(`attempt ${attempt}: ${fetchError}`);continue}
+      const res=await fetch(`${base}/internal/worker/restore`,{headers:{authorization:`Bearer ${token}`,'user-agent':'Mozilla/5.0 (compatible; OrbitHostWorker/1.0)'},signal:AbortSignal.timeout(30000)});
+      if(!res.ok){const raw=await res.text().catch(()=>'');fetchError=`control plane responded ${res.status}: ${raw.slice(0,160)}`;restoreState.attempts.push(`attempt ${attempt}: ${fetchError}`);continue}
       const parsed=await res.json().catch(()=>null);
-      if(!parsed||!Array.isArray(parsed.projects)){fetchError='restore payload was not a project list';restoreState.attempts.push(`attempt ${attempt}: ${fetchError}`);continue}
+      if(!parsed||!Array.isArray(parsed.projects)){const raw=await res.text().catch(()=>'');fetchError=`restore payload was not a project list: ${raw.slice(0,160)}`;restoreState.attempts.push(`attempt ${attempt}: ${fetchError}`);continue}
       data=parsed;
     }catch(e){fetchError=e.message;restoreState.attempts.push(`attempt ${attempt}: ${e.message}`)}
   }
