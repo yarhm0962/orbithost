@@ -400,7 +400,7 @@ async function handleClick(e) {
   if(target.dataset.authMode){state.authMode=target.dataset.authMode;render();return;}
   if(target.dataset.nav){navigate(target.dataset.nav);return;}
   if(target.dataset.openProject){await openProject(target.dataset.openProject);return;}
-  if(target.dataset.projectTab){state.activeTab=target.dataset.projectTab;if(state.activeProject?.project?.id){if(state.activeTab==='logs')await refreshLogs();if(state.activeTab==='overview')await refreshMetrics();await refreshProject().catch(()=>{});}render();return;}
+  if(target.dataset.projectTab){state.activeTab=target.dataset.projectTab;if(state.activeProject?.project?.id){if(state.activeTab==='logs')await refreshLogs();if(state.activeTab==='overview')await refreshMetrics();await refreshProject().catch(()=>{});}render();document.querySelector('.project-tab.active')?.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});return;}
   if(target.dataset.editEnv){openModal('env',{key:target.dataset.editEnv});return;}
   if(target.dataset.deleteEnv){openModal('confirm-delete-env',{key:target.dataset.deleteEnv});return;}
   if(target.dataset.resource){openModal('docs');return;}
