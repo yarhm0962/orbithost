@@ -436,7 +436,7 @@ function stopProcess(id,grace=10000){
 async function deployProcess(body,file){
   const id=String(body.projectId||'');if(!validId(id))throw new Error('Invalid project ID.');
   const version=String(body.pythonVersion||'3.12');if(!VERSIONS.has(version))throw new Error('Unsupported Python version.');
-  const buildCommand=String(body.buildCommand||'').slice(0,500);const startCommand=String(body.startCommand||'python main.py').trim().slice(0,500);
+  const buildCommand=String(body.buildCommand||'').slice(0,500);let startCommand=String(body.startCommand||'python main.py').trim().slice(0,500);
   if(!startCommand)throw new Error('Start command is required.');
   const previousSecrets=getSecrets(id);
   const env=validateEnvironment(body.envJson);
