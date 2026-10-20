@@ -4,6 +4,9 @@ compatibility_date = "2025-12-01"
 
 [vars]
 MAX_UPLOAD_MB = "8"
+MAX_ZIP_ENTRIES = "2000"
+MAX_ZIP_EXPANDED_MB = "200"
+MAX_ZIP_ENTRY_MB = "80"
 PBKDF2_ITERATIONS = "25000"
 
 [[d1_databases]]

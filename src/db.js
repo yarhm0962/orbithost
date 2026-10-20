@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  name TEXT NOT NULL, source_type TEXT NOT NULL CHECK(source_type IN ('zip','git','demo')),
+  name TEXT NOT NULL, source_type TEXT NOT NULL CHECK(source_type IN ('zip','git')),
   source_path TEXT, repository_url TEXT, python_version TEXT NOT NULL DEFAULT '3.12',
   build_command TEXT NOT NULL DEFAULT '', start_command TEXT NOT NULL DEFAULT 'python main.py',
   status TEXT NOT NULL DEFAULT 'stopped', is_sample INTEGER NOT NULL DEFAULT 0,
@@ -100,8 +100,5 @@ export function addActivity(userId, projectId, action, message) {
 }
 export function addLog(projectId, stream, level, message) {
   db.prepare('INSERT INTO project_logs(project_id, stream, level, message, created_at) VALUES(?,?,?,?,?)')
-    .run(projectId, stream, level, String(message).slice(0, 4000), now());
-  // Keep the local demo/test database bounded.
-  db.prepare('DELETE FROM project_logs WHERE project_id = ? AND id NOT IN (SELECT id FROM project_logs WHERE project_id = ? ORDER BY id DESC LIMIT 1500)')
-    .run(projectId, projectId);
+    .run(projectId, stream, level, String(message), now());
 }

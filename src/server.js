@@ -10,22 +10,26 @@ import bcrypt from 'bcryptjs';
 import multer from 'multer';
 import { rateLimit } from 'express-rate-limit';
 import yauzl from 'yauzl';
-import { db, SQLiteSessionStore, now, uuid, addActivity, addLog } from './db.js';
+import { db, SQLiteSessionStore, now, uuid, addActivity } from './db.js';
 import { encryptText, decryptText, safeText, isValidEnvKey, isValidPythonVersion, safeHttpsRepository, maskSecrets } from './security.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
-const MODE = process.env.HOSTING_MODE || 'demo';
+const MODE = 'worker';
+const projectOperations = new Set();
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || './.data/uploads');
-const MAX_UPLOAD_MB = Math.min(100, Math.max(1, Number(process.env.MAX_UPLOAD_MB || 25)));
+const MAX_UPLOAD_MB = Math.max(1, Number(process.env.MAX_UPLOAD_MB || 1024));
+const MAX_ZIP_ENTRIES = Math.max(1, Number(process.env.MAX_ZIP_ENTRIES || 100000));
+const MAX_ZIP_EXPANDED_MB = Math.max(1, Number(process.env.MAX_ZIP_EXPANDED_MB || 4096));
+const MAX_ZIP_ENTRY_MB = Math.max(1, Number(process.env.MAX_ZIP_ENTRY_MB || 2048));
 const allowedPythonVersions = ['3.10', '3.11', '3.12', '3.13'];
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const appSecret = process.env.SESSION_SECRET || '';
 const production = process.env.NODE_ENV === 'production';
 
-if (!['demo','worker'].includes(MODE)) throw new Error('HOSTING_MODE must be either demo or worker.');
+if (process.env.HOSTING_MODE === 'demo') throw new Error('Demo mode has been removed. Configure a real worker using WORKER_URL and WORKER_TOKEN.');
 if (production && (appSecret.length < 32 || /replace-with|development-only/i.test(appSecret))) throw new Error('SESSION_SECRET must be a unique high-entropy value of at least 32 characters in production.');
 if (MODE === 'worker' && (!process.env.WORKER_URL || !process.env.WORKER_TOKEN || process.env.WORKER_TOKEN.length < 32 || /replace-with/i.test(process.env.WORKER_TOKEN))) throw new Error('HOSTING_MODE=worker requires WORKER_URL and a unique WORKER_TOKEN of at least 32 characters.');
 if (!process.env.ENV_ENCRYPTION_KEY || !/^[a-f0-9]{64}$/i.test(process.env.ENV_ENCRYPTION_KEY)) {
@@ -52,7 +56,8 @@ app.use(session({
   cookie: { httpOnly: true, sameSite: 'strict', secure: production, maxAge: 1000 * 60 * 60 * 24 * 7, path: '/' }
 }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 25, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many authentication attempts. Try again later.' } }));
-app.use('/api', rateLimit({ windowMs: 60 * 1000, limit: 300, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Request rate limit reached. Try again shortly.' } }));
+// Authentication endpoints remain rate-limited to reduce credential-stuffing risk.
+// The general API is not subject to an arbitrary per-minute quota (including log streaming).
 
 const upload = multer({ storage: multer.diskStorage({ destination: (_req, _file, cb) => cb(null, UPLOAD_DIR), filename: (_req, _file, cb) => cb(null, `.incoming-${uuid()}.upload`) }), limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024, files: 1, fields: 12, fieldSize: 20000 } });
 const apiError = (res, status, error) => res.status(status).json({ error });
@@ -74,9 +79,9 @@ function projectView(p) {
   return {
     id: p.id, name: p.name, sourceType: p.source_type, repositoryUrl: p.repository_url,
     pythonVersion: p.python_version, buildCommand: p.build_command, startCommand: p.start_command,
-    status: p.status, isSample: Boolean(p.is_sample), createdAt: p.created_at, updatedAt: p.updated_at,
+    status: p.status, isSample: false, createdAt: p.created_at, updatedAt: p.updated_at,
     lastDeployedAt: p.last_deployed_at, environmentCount: envCount, deploymentCount: deployCount,
-    runtimeMode: MODE === 'demo' ? 'simulated' : 'container'
+    runtimeMode: 'container'
   };
 }
 function readEnv(projectId) {
@@ -98,25 +103,14 @@ function addDeploy(projectId, status, summary, trigger = 'manual', duration = nu
 function deploymentView(d) {
   return { id: d.id, sequence: d.sequence, status: d.status, trigger: d.trigger, summary: d.summary, createdAt: d.created_at, finishedAt: d.finished_at, durationMs: d.duration_ms };
 }
-function createDemoSeeds(userId) {
-  if (MODE !== 'demo') return;
-  const existing = db.prepare('SELECT count(*) AS n FROM projects WHERE user_id = ?').get(userId).n;
-  if (existing) return;
-  const seeds = [
-    { name: 'lunar-moderator', status: 'online', python: '3.12', start: 'python main.py', kind: 'success', summary: 'Sample deployment completed' },
-    { name: 'welcome-engine', status: 'stopped', python: '3.11', start: 'python bot.py', kind: 'stopped', summary: 'Sample service is stopped' }
-  ];
-  for (const s of seeds) {
-    const id = uuid(); const ts = now();
-    db.prepare('INSERT INTO projects(id,user_id,name,source_type,python_version,build_command,start_command,status,is_sample,created_at,updated_at,last_deployed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(id,userId,s.name,'demo',s.python,'',s.start,s.status,1,ts,ts,s.status === 'online' ? ts : null);
-    const dep = addDeploy(id, s.kind, s.summary, 'sample', 1840);
-    addLog(id, 'runtime', 'info', `[${ts}] ${s.name} — sample runtime initialized`);
-    addLog(id, 'runtime', 'info', s.status === 'online' ? 'Connected to Discord gateway (sample data only).' : 'Service stopped by user (sample data only).');
-    addLog(id, 'build', 'info', `Python ${s.python} environment prepared (sample data).`);
-  }
-  addActivity(userId, null, 'workspace_created', 'Your workspace is ready with sample projects.');
-}
+// Remove records created by the earlier prototype build, including its orphaned workspace activity.
+db.prepare("DELETE FROM activities WHERE message = 'Your workspace is ready with sample projects.'").run();
+db.prepare('DELETE FROM project_logs').run(); // Legacy local logs were not worker output; the Logs UI reads only actual worker output.
+db.prepare("DELETE FROM activities WHERE project_id IN (SELECT id FROM projects WHERE source_type = 'demo' OR is_sample = 1)").run();
+db.prepare("DELETE FROM projects WHERE source_type = 'demo' OR is_sample = 1").run();
+// Reconcile interrupted control-plane operations rather than leaving stale 'deploying' UI state after restart.
+db.prepare("UPDATE projects SET status='unknown' WHERE status='deploying'").run();
+db.prepare("UPDATE deployments SET status='unknown', summary='The control plane restarted before the worker result was confirmed.', finished_at=?, duration_ms=NULL WHERE status='building'").run(now());
 
 function inspectZip(filePath) {
   return new Promise((resolve, reject) => {
@@ -134,9 +128,9 @@ function inspectZip(filePath) {
         if (!name || name.includes('\0') || name.includes('\\') || name.startsWith('/') || /^[a-zA-Z]:/.test(name) || name.split('/').includes('..') || normalized === '..' || normalized.startsWith('../')) return fail('ZIP contains an unsafe file path.');
         if (mode === 0o120000) return fail('ZIP symbolic links are not allowed.');
         count++; expanded += Number(entry.uncompressedSize || 0);
-        if (count > 2000) return fail('ZIP contains too many files (maximum 2,000).');
-        if (expanded > 200 * 1024 * 1024) return fail('ZIP expands beyond the 200 MB limit.');
-        if (Number(entry.uncompressedSize || 0) > 80 * 1024 * 1024) return fail('A single ZIP entry is too large.');
+        if (count > MAX_ZIP_ENTRIES) return fail('ZIP contains too many files for the configured extraction safety limit.');
+        if (expanded > MAX_ZIP_EXPANDED_MB * 1024 * 1024) return fail('ZIP expands beyond the configured extraction safety limit.');
+        if (Number(entry.uncompressedSize || 0) > MAX_ZIP_ENTRY_MB * 1024 * 1024) return fail('A single ZIP entry exceeds the configured extraction safety limit.');
         zip.readEntry();
       });
       zip.on('end', () => { if (!failed) { if (!count) return reject(new Error('ZIP archive is empty.')); resolve({ files: count, expandedBytes: expanded }); } });
@@ -145,11 +139,11 @@ function inspectZip(filePath) {
   });
 }
 
-async function workerRequest(route, options = {}) {
+async function workerRequest(route, options = {}, timeoutMs = Number(process.env.WORKER_TIMEOUT_MS || 3600000)) {
   const base = (process.env.WORKER_URL || '').replace(/\/$/, '');
   if (!base || !process.env.WORKER_TOKEN) throw new Error('Container worker is not configured.');
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Number(process.env.WORKER_TIMEOUT_MS || 180000));
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`${base}${route}`, { ...options, signal: controller.signal, headers: { authorization: `Bearer ${process.env.WORKER_TOKEN}`, ...(options.headers || {}) } });
     const raw = await response.text();
@@ -157,6 +151,19 @@ async function workerRequest(route, options = {}) {
     if (!response.ok) throw new Error(data.error || `Worker returned ${response.status}.`);
     return data;
   } finally { clearTimeout(timer); }
+}
+async function liveProjectView(project) {
+  try {
+    const measured = await workerRequest(`/v1/projects/${project.id}/status`, {}, 15000);
+    if (project.status === 'deploying') return projectView({ ...project, status:'deploying' });
+    const measuredStatus = ['online','stopped','failed','unknown'].includes(measured.status) ? measured.status : 'unknown';
+    db.prepare("UPDATE projects SET status=? WHERE id=? AND status <> 'deploying'").run(measuredStatus,project.id);
+    const current=db.prepare('SELECT status FROM projects WHERE id=?').get(project.id);
+    return projectView({ ...project, status:current?.status||measuredStatus });
+  } catch {
+    const current=db.prepare('SELECT status FROM projects WHERE id=?').get(project.id);
+    return projectView({ ...project, status:current?.status==='deploying'?'deploying':'unknown' });
+  }
 }
 async function deployWithWorker(p, deploymentId) {
   const env = Object.fromEntries(readEnv(p.id).map((item) => [item.key, item.value]));
@@ -176,7 +183,17 @@ async function deployWithWorker(p, deploymentId) {
 }
 
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'orbithost-control-plane', mode: MODE, time: now() }));
-app.get('/api/config', (req, res) => res.json({ hostingMode: MODE, isPrototype: MODE === 'demo', maxUploadMb: MAX_UPLOAD_MB, pythonVersions: allowedPythonVersions }));
+app.get('/api/config', async (req, res) => {
+  let workerReady = false;
+  try {
+    const base = (process.env.WORKER_URL || '').replace(/\/$/, '');
+    if (base && process.env.WORKER_TOKEN) {
+      const response = await fetch(`${base}/v1/healthz`, { signal: AbortSignal.timeout(2500), headers: { authorization: `Bearer ${process.env.WORKER_TOKEN}` } });
+      workerReady = response.ok;
+    }
+  } catch {}
+  res.json({ hostingMode: MODE, isPrototype: false, workerReady, maxUploadMb: MAX_UPLOAD_MB, pythonVersions: allowedPythonVersions });
+});
 app.get('/api/auth/csrf', (req, res) => {
   if (!req.session.csrfToken) req.session.csrfToken = crypto.randomBytes(32).toString('base64url');
   res.json({ csrfToken: req.session.csrfToken });
@@ -196,7 +213,6 @@ app.post('/api/auth/register', async (req, res, next) => {
     if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) return apiError(res, 409, 'An account with that email already exists.');
     const user = { id: uuid(), email, created_at: now() };
     db.prepare('INSERT INTO users(id,email,password_hash,created_at) VALUES(?,?,?,?)').run(user.id, email, await bcrypt.hash(password, 12), user.created_at);
-    createDemoSeeds(user.id);
     req.session.regenerate((err) => {
       if (err) return next(err);
       req.session.userId = user.id; req.session.csrfToken = crypto.randomBytes(32).toString('base64url');
@@ -221,17 +237,18 @@ app.post('/api/auth/logout', requireAuth, (req, res, next) => req.session.destro
   if (err) return next(err); res.clearCookie('orb.sid', { httpOnly: true, sameSite: 'strict', secure: production, path: '/' }); res.json({ ok: true });
 }));
 
-app.get('/api/dashboard', requireAuth, (req, res) => {
-  const projects = db.prepare('SELECT * FROM projects WHERE user_id = ? ORDER BY updated_at DESC').all(req.session.userId).map(projectView);
+app.get('/api/dashboard', requireAuth, async (req, res) => {
+  const rows = db.prepare('SELECT * FROM projects WHERE user_id = ? ORDER BY updated_at DESC').all(req.session.userId);
+  const projects = await Promise.all(rows.map(liveProjectView));
   const count = (status) => projects.filter((p) => p.status === status).length;
   const activity = db.prepare('SELECT a.id,a.action,a.message,a.created_at,p.name AS project_name FROM activities a LEFT JOIN projects p ON p.id=a.project_id WHERE a.user_id=? ORDER BY a.id DESC LIMIT 8').all(req.session.userId)
     .map((a) => ({ id:a.id, action:a.action, message:a.message, createdAt:a.created_at, projectName:a.project_name }));
   const deploys = db.prepare('SELECT d.*,p.name AS project_name FROM deployments d JOIN projects p ON p.id=d.project_id WHERE p.user_id=? ORDER BY d.created_at DESC LIMIT 6').all(req.session.userId);
-  res.json({ projects, activity, recentDeployments: deploys.map((d) => ({ ...deploymentView(d), projectName:d.project_name })), stats: { total:projects.length, online:count('online'), stopped:count('stopped'), deploying:count('deploying'), uptime: MODE === 'demo' ? '99.9%' : null }, hostingMode:MODE });
+  res.json({ projects, activity, recentDeployments: deploys.map((d) => ({ ...deploymentView(d), projectName:d.project_name })), stats: { total:projects.length, online:count('online'), stopped:count('stopped'), deploying:count('deploying'), uptime: null }, hostingMode:MODE });
 });
-app.get('/api/projects', requireAuth, (req, res) => {
+app.get('/api/projects', requireAuth, async (req, res) => {
   const rows = db.prepare('SELECT * FROM projects WHERE user_id = ? ORDER BY updated_at DESC').all(req.session.userId);
-  res.json({ projects: rows.map(projectView) });
+  res.json({ projects: await Promise.all(rows.map(liveProjectView)) });
 });
 app.post('/api/projects', requireAuth, upload.single('bundle'), async (req, res, next) => {
   let storedPath = null;
@@ -252,7 +269,6 @@ app.post('/api/projects', requireAuth, upload.single('bundle'), async (req, res,
       db.prepare('INSERT INTO projects(id,user_id,name,source_type,repository_url,python_version,build_command,start_command,status,is_sample,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(id,req.session.userId,name,'git',repositoryUrl,pythonVersion,buildCommand,startCommand,'stopped',0,ts,ts);
       addActivity(req.session.userId,id,'project_created',`${name} was connected to Git.`);
-      addLog(id,'build','info',`Repository connected: ${new URL(repositoryUrl).host}`);
       return res.status(201).json({ project:projectView(ownerProject(req.session.userId,id)) });
     }
     if (sourceType !== 'zip' || !req.file) return apiError(res, 400, 'Upload a ZIP archive or choose a Git repository.');
@@ -271,22 +287,33 @@ app.post('/api/projects', requireAuth, upload.single('bundle'), async (req, res,
       db.prepare('INSERT INTO projects(id,user_id,name,source_type,source_path,python_version,build_command,start_command,status,is_sample,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(id,req.session.userId,name,'zip',storedPath,pythonVersion,buildCommand,startCommand,'stopped',0,ts,ts);
       addActivity(req.session.userId,id,'project_created',`${name} was created from a ZIP upload.`);
-      addLog(id,'build','info',`Source archive received (${Math.round(req.file.size/1024)} KB).`);
       res.status(201).json({ project:projectView(ownerProject(req.session.userId,id)) });
     } catch (e) { if (uploadedTemp) await fs.promises.rm(uploadedTemp,{force:true}); if (storedPath) await fs.promises.rm(storedPath,{force:true}); throw e; }
   } catch (error) { next(error); }
   finally { if (uploadedTemp) await fs.promises.rm(uploadedTemp,{force:true}).catch(()=>{}); }
 });
-app.get('/api/projects/:id', requireAuth, (req, res) => {
-  const p = ownerProject(req.session.userId, req.params.id);
+app.get('/api/projects/:id', requireAuth, async (req, res) => {
+  let p = ownerProject(req.session.userId, req.params.id);
   if (!p) return apiError(res,404,'Project not found.');
+  try {
+    const measured=await workerRequest(`/v1/projects/${p.id}/status`,{},15000);
+    if(p.status!=='deploying' && measured.status && ['online','stopped','failed','unknown'].includes(measured.status)) {
+      db.prepare("UPDATE projects SET status=? WHERE id=? AND status <> 'deploying'").run(measured.status,p.id);
+      const current=db.prepare('SELECT status FROM projects WHERE id=?').get(p.id);
+      p={...p,status:current?.status||measured.status};
+    } else if(p.status==='deploying') p={...p,status:'deploying'};
+  } catch {
+    const current=db.prepare('SELECT status FROM projects WHERE id=?').get(p.id);
+    if(p.status!=='deploying')p={...p,status:current?.status==='deploying'?'deploying':'unknown'};
+  }
   const latest = db.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC LIMIT 1').get(p.id);
-  const deployments = db.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC LIMIT 20').all(p.id);
+  const deployments = db.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC').all(p.id);
   res.json({ project:projectView(p), environment:envView(p.id), latestDeployment:latest?deploymentView(latest):null, deployments:deployments.map(deploymentView), runtimeMode:MODE });
 });
 app.patch('/api/projects/:id', requireAuth, (req, res) => {
   const p = ownerProject(req.session.userId,req.params.id);
   if (!p) return apiError(res,404,'Project not found.');
+  if (p.status==='deploying'||projectOperations.has(p.id)) return apiError(res,409,'Project settings cannot change while an operation is running.');
   const name = req.body?.name === undefined ? p.name : safeText(req.body.name,60);
   const pythonVersion = req.body?.pythonVersion === undefined ? p.python_version : req.body.pythonVersion;
   const buildCommand = req.body?.buildCommand === undefined ? p.build_command : safeText(req.body.buildCommand,500);
@@ -306,6 +333,7 @@ app.get('/api/projects/:id/env', requireAuth, (req,res) => {
 app.put('/api/projects/:id/env', requireAuth, (req,res,next) => {
   try {
     const p=ownerProject(req.session.userId,req.params.id); if(!p) return apiError(res,404,'Project not found.');
+    if(p.status==='deploying'||projectOperations.has(p.id)) return apiError(res,409,'Environment variables cannot change while an operation is running.');
     const key=safeText(req.body?.key,128); const value=typeof req.body?.value==='string'?req.body.value:'';
     if(!isValidEnvKey(key)) return apiError(res,400,'Variable names must start with a letter or underscore and contain only letters, numbers, and underscores.');
     if(value.length>8192 || /[\r\n\0]/.test(value)) return apiError(res,400,'Secret values must be 8 KB or less and cannot contain line breaks.');
@@ -323,6 +351,7 @@ app.put('/api/projects/:id/env', requireAuth, (req,res,next) => {
 });
 app.delete('/api/projects/:id/env/:key', requireAuth, (req,res) => {
   const p=ownerProject(req.session.userId,req.params.id); if(!p) return apiError(res,404,'Project not found.');
+  if(p.status==='deploying'||projectOperations.has(p.id)) return apiError(res,409,'Environment variables cannot change while an operation is running.');
   const key=req.params.key;
   const result=db.prepare('DELETE FROM env_vars WHERE project_id=? AND key=?').run(p.id,key);
   if(!result.changes) return apiError(res,404,'Variable not found.');
@@ -331,43 +360,42 @@ app.delete('/api/projects/:id/env/:key', requireAuth, (req,res) => {
 });
 app.get('/api/projects/:id/deployments', requireAuth, (req,res) => {
   const p=ownerProject(req.session.userId,req.params.id); if(!p) return apiError(res,404,'Project not found.');
-  res.json({ deployments:db.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC LIMIT 50').all(p.id).map(deploymentView) });
+  res.json({ deployments:db.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC').all(p.id).map(deploymentView) });
 });
 app.post('/api/projects/:id/deploy', requireAuth, async (req,res,next) => {
   const p=ownerProject(req.session.userId,req.params.id); if(!p) return apiError(res,404,'Project not found.');
-  if(p.status==='deploying') return apiError(res,409,'A deployment is already in progress for this project.');
+  if(p.status==='deploying'||projectOperations.has(p.id)) return apiError(res,409,'Another operation is already in progress for this project.');
   const started=Date.now();
   const deployment=addDeploy(p.id,'building','Deployment is being prepared.');
   db.prepare('UPDATE projects SET status=?,updated_at=? WHERE id=?').run('deploying',now(),p.id);
   addActivity(req.session.userId,p.id,'deployment_started',`${p.name} deployment started.`);
-  addLog(p.id,'build','info',`Starting deployment #${deployment.sequence}…`);
+  projectOperations.add(p.id);
   try {
-    let result;
-    if(MODE==='worker') result=await deployWithWorker(p,deployment.id);
-    else {
-      addLog(p.id,'build','info','Checking source bundle and runtime settings…');
-      addLog(p.id,'build','info',`Preparing Python ${p.python_version} runtime (simulated).`);
-      addLog(p.id,'runtime','info','DEMO MODE: no bot process or Discord connection has been started.');
-      result={ status:'online', containerId:null };
-    }
+    const result=await deployWithWorker(p,deployment.id);
+    let runtimeStatus='unknown';
+    try {
+      const measured=await workerRequest(`/v1/projects/${p.id}/status`,{},15000);
+      if(['online','stopped','failed','unknown'].includes(measured.status))runtimeStatus=measured.status;
+    } catch {}
     const duration=Date.now()-started;
+    const summary=runtimeStatus==='online'?'Container deployed and process is running.':runtimeStatus==='stopped'?'Container was created, but its process is not running. Inspect runtime logs.':'Container deployment completed; runtime status could not be confirmed.';
     db.prepare('UPDATE deployments SET status=?,summary=?,finished_at=?,duration_ms=? WHERE id=?')
-      .run('success',MODE==='demo'?'Simulated deployment completed — demo mode.':'Container deployed successfully.',now(),duration,deployment.id);
-    db.prepare('UPDATE projects SET status=?,updated_at=?,last_deployed_at=? WHERE id=?').run('online',now(),now(),p.id);
-    addLog(p.id,'build','info',MODE==='demo'?'Demo deployment finished; no code was executed.':'Build succeeded and container started.');
-    addActivity(req.session.userId,p.id,'deployment_succeeded',`${p.name} deployment ${MODE==='demo'?'was simulated':'succeeded'}.`);
-    res.json({ project:projectView(ownerProject(req.session.userId,p.id)), deployment:deploymentView(db.prepare('SELECT * FROM deployments WHERE id=?').get(deployment.id)), message:MODE==='demo'?'Simulated deployment complete. Configure the isolated worker to run a real bot.':'Deployment completed.' });
+      .run('success',summary,now(),duration,deployment.id);
+    db.prepare('UPDATE projects SET status=?,updated_at=?,last_deployed_at=? WHERE id=?').run(runtimeStatus,now(),now(),p.id);
+    addActivity(req.session.userId,p.id,'deployment_succeeded',`${p.name} deployment completed; runtime status is ${runtimeStatus}.`);
+    const message=runtimeStatus==='online'?'Deployment completed and the process is running.':runtimeStatus==='stopped'?'The image was deployed, but the process is stopped. Inspect runtime logs for the startup error.':'Deployment completed, but the worker could not confirm runtime status.';
+    res.json({ project:projectView(ownerProject(req.session.userId,p.id)), deployment:deploymentView(db.prepare('SELECT * FROM deployments WHERE id=?').get(deployment.id)), message:result?.message||message });
   } catch(error) {
     const duration=Date.now()-started;
     db.prepare('UPDATE deployments SET status=?,summary=?,finished_at=?,duration_ms=? WHERE id=?').run('failed',maskSecrets(error.message,readEnv(p.id).map(x=>x.value)),now(),duration,deployment.id);
     db.prepare('UPDATE projects SET status=?,updated_at=? WHERE id=?').run('failed',now(),p.id);
-    addLog(p.id,'build','error',maskSecrets(error.message,readEnv(p.id).map(x=>x.value)));
     addActivity(req.session.userId,p.id,'deployment_failed',`${p.name} deployment failed.`);
     next(error);
-  }
+  } finally { projectOperations.delete(p.id); }
 });
 app.post('/api/projects/:id/action', requireAuth, async (req,res,next) => {
   const p=ownerProject(req.session.userId,req.params.id); if(!p) return apiError(res,404,'Project not found.');
+  if(p.status==='deploying'||projectOperations.has(p.id)) return apiError(res,409,'Project actions are unavailable while another operation is running.');
   const action=req.body?.action;
   if(!['start','stop','restart','redeploy'].includes(action)) return apiError(res,400,'Unsupported project action.');
   if(action==='redeploy') {
@@ -375,50 +403,80 @@ app.post('/api/projects/:id/action', requireAuth, async (req,res,next) => {
     req.url=`/api/projects/${p.id}/deploy`;
     return res.status(307).set('Location',req.url).end();
   }
+  projectOperations.add(p.id);
   try {
-    if(MODE==='worker') await workerRequest(`/v1/projects/${p.id}/action`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action})});
-    const status=action==='stop'?'stopped':'online';
-    db.prepare('UPDATE projects SET status=?,updated_at=? WHERE id=?').run(status,now(),p.id);
-    addLog(p.id,'runtime','info',MODE==='demo'?`${action} action simulated; no process was started.`:`Container ${action} requested.`);
-    addActivity(req.session.userId,p.id,`project_${action}`,`${p.name} ${action} action completed${MODE==='demo'?' (demo mode)':''}.`);
-    res.json({project:projectView(ownerProject(req.session.userId,p.id)),message:MODE==='demo'?`${action[0].toUpperCase()+action.slice(1)} simulated in demo mode.`:`Bot ${action} completed.`});
-  } catch(error) { next(error); }
+    await workerRequest(`/v1/projects/${p.id}/action`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action})});
+    const measured=await workerRequest(`/v1/projects/${p.id}/status`,{},15000);
+    const status=['online','stopped','failed','unknown'].includes(measured.status)?measured.status:'unknown';
+    db.prepare("UPDATE projects SET status=?,updated_at=? WHERE id=? AND status <> 'deploying'").run(status,now(),p.id);
+    addActivity(req.session.userId,p.id,`project_${action}`,`${p.name} ${action} action completed; runtime status is ${status}.`);
+    res.json({project:projectView(ownerProject(req.session.userId,p.id)),message:`Bot ${action} completed; runtime status is ${status}.`});
+  } catch(error) { next(error); } finally { projectOperations.delete(p.id); }
 });
 app.delete('/api/projects/:id', requireAuth, async (req,res,next) => {
   const p=ownerProject(req.session.userId,req.params.id); if(!p) return apiError(res,404,'Project not found.');
+  if(p.status==='deploying'||projectOperations.has(p.id)) return apiError(res,409,'A project cannot be deleted while an operation is running.');
+  projectOperations.add(p.id);
   try {
-    if(MODE==='worker') await workerRequest(`/v1/projects/${p.id}/action`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'delete'})});
+    await workerRequest(`/v1/projects/${p.id}/action`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'delete'})});
     addActivity(req.session.userId,null,'project_deleted',`${p.name} was deleted.`);
     if(p.source_path) await fs.promises.rm(p.source_path,{force:true}).catch(()=>{});
     db.prepare('DELETE FROM projects WHERE id=?').run(p.id);
     res.json({ok:true});
-  } catch(error) { next(error); }
+  } catch(error) { next(error); } finally { projectOperations.delete(p.id); }
 });
 app.get('/api/projects/:id/logs', requireAuth, async (req,res,next) => {
   const p=ownerProject(req.session.userId,req.params.id); if(!p) return apiError(res,404,'Project not found.');
   const stream=['build','runtime'].includes(req.query.stream)?req.query.stream:'runtime';
   const search=safeText(String(req.query.search||''),120).toLowerCase();
   try {
-    let entries;
-    if(MODE==='worker' && p.source_type!=='demo') {
-      const data=await workerRequest(`/v1/projects/${p.id}/logs?stream=${encodeURIComponent(stream)}`);
-      entries=data.entries||[];
-    } else {
-      entries=db.prepare('SELECT id,stream,level,message,created_at AS createdAt FROM project_logs WHERE project_id=? AND stream=? ORDER BY id DESC LIMIT 500').all(p.id,stream).reverse();
-    }
+    const data=await workerRequest(`/v1/projects/${p.id}/logs?stream=${encodeURIComponent(stream)}`);
+    let entries=data.entries||[];
     const secrets=readEnv(p.id).map((x)=>x.value);
     entries=entries.map((line)=>({...line,message:maskSecrets(line.message,secrets)}));
     if(search) entries=entries.filter((line)=>line.message.toLowerCase().includes(search)||line.level.toLowerCase().includes(search));
-    res.json({entries,stream,mode:MODE==='demo'?'simulated':'container'});
+    res.json({entries,stream,mode:'container',cursor:data.cursor??null});
   } catch(error) { next(error); }
+});
+app.get('/api/projects/:id/logs/stream', requireAuth, async (req,res,next) => {
+  const p=ownerProject(req.session.userId,req.params.id); if(!p) return apiError(res,404,'Project not found.');
+  const stream=['build','runtime'].includes(req.query.stream)?req.query.stream:'runtime';
+  const upstreamController=new AbortController();
+  res.on('close',()=>upstreamController.abort());
+  try {
+    const base=(process.env.WORKER_URL||'').replace(/\/$/,'');
+    if(!base||!process.env.WORKER_TOKEN) throw new Error('A real container worker is not configured.');
+    const qs=new URLSearchParams({stream});
+    if(stream==='build' && req.query.offset!=null && /^\d+$/.test(String(req.query.offset))) qs.set('offset',String(req.query.offset));
+    if(stream==='runtime' && req.query.since && !Number.isNaN(Date.parse(String(req.query.since)))) qs.set('since',String(req.query.since));
+    const upstream=await fetch(`${base}/v1/projects/${encodeURIComponent(p.id)}/logs/stream?${qs}`,{headers:{authorization:`Bearer ${process.env.WORKER_TOKEN}`,accept:'text/event-stream'},signal:upstreamController.signal});
+    if(!upstream.ok) {
+      const raw=await upstream.text(); let detail='Could not connect to the live log stream.'; try{detail=JSON.parse(raw).error||detail}catch{}
+      if(!res.headersSent) return apiError(res,upstream.status,detail);
+      return res.end();
+    }
+    res.status(200).set({ 'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache, no-transform','Connection':'keep-alive','X-Accel-Buffering':'no' });
+    res.flushHeaders();
+    if(!upstream.body) return res.end();
+    for await (const chunk of upstream.body) {
+      if(res.destroyed) break;
+      if(!res.write(Buffer.from(chunk))) await new Promise(resolve=>res.once('drain',resolve));
+    }
+    if(!res.writableEnded) res.end();
+  } catch(error) {
+    if(upstreamController.signal.aborted) return;
+    if(!res.headersSent) next(error); else res.end();
+  }
 });
 app.get('/api/projects/:id/metrics', requireAuth, async (req,res,next) => {
   const p=ownerProject(req.session.userId,req.params.id); if(!p) return apiError(res,404,'Project not found.');
-  if(MODE==='worker' && p.source_type!=='demo') {
-    try { return res.json(await workerRequest(`/v1/projects/${p.id}/status`)); } catch(error) { return next(error); }
-  }
-  const online=p.status==='online';
-  res.json({status:p.status,cpuPercent:online?Number((3+Math.random()*8).toFixed(1)):0,memoryMb:online?Math.round(62+Math.random()*45):0,memoryLimitMb:256,uptime:p.last_deployed_at?Math.max(1,Math.floor((Date.now()-new Date(p.last_deployed_at).getTime())/1000)):0,mode:'simulated'});
+  try {
+    const measured=await workerRequest(`/v1/projects/${p.id}/status`);
+    if(p.status!=='deploying' && measured.status && ['online','stopped','failed','unknown'].includes(measured.status))
+      db.prepare("UPDATE projects SET status=?,updated_at=? WHERE id=? AND status <> 'deploying'").run(measured.status,now(),p.id);
+    const current=db.prepare('SELECT status FROM projects WHERE id=?').get(p.id);
+    return res.json(current?.status==='deploying'?{...measured,status:'deploying'}:measured);
+  } catch(error) { return next(error); }
 });
 
 app.use('/api', (req,res) => apiError(res,404,'API endpoint not found.'));
