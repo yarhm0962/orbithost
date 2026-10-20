@@ -506,11 +506,22 @@ async function containerActionProcess(id,action){
   await spawnBot(id,secrets);
   return {status:'online'};
 }
+function resolveMainPid(pid){
+  try{
+    if(/python/.test(fs.readFileSync(`/proc/${pid}/cmdline`,'utf8')))return pid;
+    const dir=`/proc/${pid}/task`;
+    for(const tid of fs.readdirSync(dir)){
+      const kids=fs.readFileSync(`${dir}/${tid}/children`,'utf8').trim().split(/\s+/).filter(Boolean);
+      for(const k of kids){try{if(/python/.test(fs.readFileSync(`/proc/${k}/cmdline`,'utf8')))return Number(k)}catch{}}
+    }
+  }catch{}
+  return pid;
+}
 async function getStatusProcess(id){
   if(!validId(id))throw new Error('Invalid project ID.');
   const entry=procs.get(id);
   if(!entry)return {status:'stopped',cpuPercent:0,memoryMb:0,memoryLimitMb:null,uptime:0,mode:'process'};
-  const pid=entry.child.pid;let cpuPercent=null,memoryMb=null;
+  const pid=resolveMainPid(entry.child.pid);let cpuPercent=null,memoryMb=null;
   try{
     const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8').split(' ');
     const ticks=Number(stat[13])+Number(stat[14])+Number(stat[15])+Number(stat[16]);
@@ -520,7 +531,7 @@ async function getStatusProcess(id){
     const rss=fs.readFileSync(`/proc/${pid}/status`,'utf8').match(/VmRSS:\s+(\d+)\s+kB/);
     if(rss)memoryMb=Math.round(Number(rss[1])/1024);
   }catch{}
-  return {status:'online',cpuPercent,memoryMb,memoryLimitMb:null,uptime:Math.max(0,Math.floor((Date.now()-entry.startedAt)/1000)),mode:'process'};
+  return {status:'online',cpuPercent,memoryMb,memoryLimitMb:Math.round(os.totalmem()/1048576),uptime:Math.max(0,Math.floor((Date.now()-entry.startedAt)/1000)),mode:'process'};
 }
 async function getLogsProcess(id,stream){
   if(!validId(id))throw new Error('Invalid project ID.');
