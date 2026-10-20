@@ -595,7 +595,7 @@ async function restoreFromControlPlane(){
   for(let attempt=1;attempt<=3&&!data;attempt++){
     if(attempt>1)await new Promise(r=>setTimeout(r,20000));
     try{
-      const res=await fetch(`${base}/internal/worker/restore`,{headers:{authorization:`Bearer ${token}`,'user-agent':'Mozilla/5.0 (compatible; OrbitHostWorker/1.0)'},signal:AbortSignal.timeout(30000)});
+      const res=await fetch(`${base}/api/internal/worker/restore`,{headers:{authorization:`Bearer ${token}`,'user-agent':'Mozilla/5.0 (compatible; OrbitHostWorker/1.0)'},signal:AbortSignal.timeout(30000)});
       if(!res.ok){const raw=await res.text().catch(()=>'');fetchError=`control plane responded ${res.status}: ${raw.slice(0,160)}`;restoreState.attempts.push(`attempt ${attempt}: ${fetchError}`);continue}
       const parsed=await res.json().catch(()=>null);
       if(!parsed||!Array.isArray(parsed.projects)){const raw=await res.text().catch(()=>'');fetchError=`restore payload was not a project list: ${raw.slice(0,160)}`;restoreState.attempts.push(`attempt ${attempt}: ${fetchError}`);continue}
@@ -617,7 +617,7 @@ async function restoreFromControlPlane(){
             await fs.promises.rm(path.join(dir,'.git'),{recursive:true,force:true});
             await fs.promises.rm(path.join(dir,'Dockerfile'),{force:true});
           }else if(p.sourceType==='zip'){
-            const res2=await fetch(`${base}/internal/worker/bundle/${id}`,{headers:{authorization:`Bearer ${token}`},signal:AbortSignal.timeout(60000)});
+            const res2=await fetch(`${base}/api/internal/worker/bundle/${id}`,{headers:{authorization:`Bearer ${token}`},signal:AbortSignal.timeout(60000)});
             if(!res2.ok)throw new Error(`stored bundle fetch failed (${res2.status})`);
             const buf=Buffer.from(await res2.arrayBuffer());
             if(!(buf[0]===0x50&&buf[1]===0x4b))throw new Error('stored bundle is not a valid ZIP');
