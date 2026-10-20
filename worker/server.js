@@ -585,15 +585,25 @@ function recoverProcesses(){
     });
   }
 }
+const restoreState={ranAt:null,attempts:[],results:[]};
 async function restoreFromControlPlane(){
   const base=String(process.env.CONTROL_PLANE_URL||'').replace(/\/$/,'');
   const token=process.env.WORKER_TOKEN||'';
-  if(!base||!token){console.log('[OrbitHost worker] Boot restore disabled: CONTROL_PLANE_URL not set.');return}
-  try{
-    const res=await fetch(`${base}/internal/worker/restore`,{headers:{authorization:`Bearer ${token}`},signal:AbortSignal.timeout(30000)});
-    if(!res.ok){console.log(`[OrbitHost worker] Boot restore skipped: control plane responded ${res.status}.`);return}
-    const data=await res.json();const projects=Array.isArray(data.projects)?data.projects:[];
-    if(!projects.length){console.log('[OrbitHost worker] Boot restore: no projects on file.');return}
+  restoreState.ranAt=new Date().toISOString();
+  if(!base||!token){restoreState.attempts.push('skipped: CONTROL_PLANE_URL not set');return}
+  let data=null,fetchError='';
+  for(let attempt=1;attempt<=3&&!data;attempt++){
+    if(attempt>1)await new Promise(r=>setTimeout(r,20000));
+    try{
+      const res=await fetch(`${base}/internal/worker/restore`,{headers:{authorization:`Bearer ${token}`},signal:AbortSignal.timeout(30000)});
+      if(!res.ok){fetchError=`control plane responded ${res.status}`;restoreState.attempts.push(`attempt ${attempt}: ${fetchError}`);continue}
+      const parsed=await res.json().catch(()=>null);
+      if(!parsed||!Array.isArray(parsed.projects)){fetchError='restore payload was not a project list';restoreState.attempts.push(`attempt ${attempt}: ${fetchError}`);continue}
+      data=parsed;
+    }catch(e){fetchError=e.message;restoreState.attempts.push(`attempt ${attempt}: ${e.message}`)}
+  }
+  if(!data){console.log(`[OrbitHost worker] Boot restore failed: ${fetchError}`);return}
+  const projects=data.projects;
     let restored=0,started=0;
     for(const p of projects){
       const id=String(p.id||'');if(!validId(id))continue;
@@ -634,13 +644,14 @@ async function restoreFromControlPlane(){
           }catch(e){console.log(`[OrbitHost worker] Boot restore: venv build failed for ${id}: ${e.message}`)}
         }
         restored++;
-        if(p.status==='stopped'){continue}
-        if(prevMeta&&prevMeta.autoStart===false){continue}
+        if(p.status==='stopped'){restoreState.results.push({id,ok:true,started:false,reason:'status stopped'});continue}
+        if(prevMeta&&prevMeta.autoStart===false){restoreState.results.push({id,ok:true,started:false,reason:'user stopped'});continue}
+        const startedBefore=started;
         await spawnBot(id,envObj).then(()=>{started++}).catch((e)=>{try{fs.appendFileSync(runtimeArchivePath(id),stampLine(`[OrbitHost worker] Boot restore: could not start process: ${e.message}`),{mode:0o600})}catch{}})
-      }catch(e){console.log(`[OrbitHost worker] Boot restore failed for project ${id}: ${e.message}`)}
+      }catch(e){restoreState.results.push({id,ok:false,error:e.message});console.log(`[OrbitHost worker] Boot restore failed for project ${id}: ${e.message}`);continue}
+      restoreState.results.push({id,ok:true,started:startedBefore===started?false:true});
     }
     console.log(`[OrbitHost worker] Boot restore complete: ${restored} project(s) restored, ${started} started.`);
-  }catch(e){console.log(`[OrbitHost worker] Boot restore failed: ${e.message}`)}
 }
 const deployImpl=RUNTIME==='docker'?deployDocker:deployProcess;
 const actionImpl=RUNTIME==='docker'?dockerContainerActionDocker:containerActionProcess;
@@ -661,6 +672,7 @@ const deployHandler=async(req,res)=>{
   }};
 app.post('/v1/deploy',upload.single('bundle'),(req,res)=>{if(req.body&&!req.body.projectId&&req.params&&req.params.id)req.body.projectId=req.params.id;return deployHandler(req,res)});
 app.post('/v1/projects/:id/deploy',upload.single('bundle'),(req,res)=>{req.body=req.body||{};if(!req.body.projectId)req.body.projectId=req.params.id;return deployHandler(req,res)});
+app.get('/v1/restore/status',(req,res)=>res.json(restoreState));
 app.post('/v1/projects/:id/action',async(req,res)=>{try{res.json(await actionImpl(req.params.id,req.body?.action))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/status',async(req,res)=>{try{res.json(await statusImpl(req.params.id))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/logs',async(req,res)=>{try{const stream=req.query.stream==='build'?'build':'runtime';res.json(await logsImpl(req.params.id,stream))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
