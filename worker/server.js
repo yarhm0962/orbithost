@@ -604,6 +604,7 @@ async function restoreFromControlPlane(){
   }
   if(!data){console.log(`[OrbitHost worker] Boot restore failed: ${fetchError}`);return}
   const projects=data.projects;
+  restoreState.attempts.push(`payload ok: ${projects.length} project(s)`);
     let restored=0,started=0;
     for(const p of projects){
       const id=String(p.id||'');if(!validId(id))continue;
@@ -672,6 +673,7 @@ const deployHandler=async(req,res)=>{
   }};
 app.post('/v1/deploy',upload.single('bundle'),(req,res)=>{if(req.body&&!req.body.projectId&&req.params&&req.params.id)req.body.projectId=req.params.id;return deployHandler(req,res)});
 app.post('/v1/projects/:id/deploy',upload.single('bundle'),(req,res)=>{req.body=req.body||{};if(!req.body.projectId)req.body.projectId=req.params.id;return deployHandler(req,res)});
+app.get('/v1/restore/run',async(req,res)=>{await restoreFromControlPlane();res.json(restoreState)});
 app.get('/v1/restore/status',(req,res)=>res.json(restoreState));
 app.post('/v1/projects/:id/action',async(req,res)=>{try{res.json(await actionImpl(req.params.id,req.body?.action))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/status',async(req,res)=>{try{res.json(await statusImpl(req.params.id))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
