@@ -647,10 +647,8 @@ async function restoreFromControlPlane(){
         restored++;
         if(p.status==='stopped'){restoreState.results.push({id,ok:true,started:false,reason:'status stopped'});continue}
         if(prevMeta&&prevMeta.autoStart===false){restoreState.results.push({id,ok:true,started:false,reason:'user stopped'});continue}
-        const startedBefore=started;
-        await spawnBot(id,envObj).then(()=>{started++}).catch((e)=>{try{fs.appendFileSync(runtimeArchivePath(id),stampLine(`[OrbitHost worker] Boot restore: could not start process: ${e.message}`),{mode:0o600})}catch{}})
+        await spawnBot(id,envObj).then(()=>{started++;restoreState.results.push({id,ok:true,started:true})}).catch((e)=>{try{fs.appendFileSync(runtimeArchivePath(id),stampLine(`[OrbitHost worker] Boot restore: could not start process: ${e.message}`),{mode:0o600})}catch{};restoreState.results.push({id,ok:true,started:false,error:e.message})})
       }catch(e){restoreState.results.push({id,ok:false,error:e.message});console.log(`[OrbitHost worker] Boot restore failed for project ${id}: ${e.message}`);continue}
-      restoreState.results.push({id,ok:true,started:startedBefore===started?false:true});
     }
     console.log(`[OrbitHost worker] Boot restore complete: ${restored} project(s) restored, ${started} started.`);
 }
@@ -659,7 +657,8 @@ const actionImpl=RUNTIME==='docker'?dockerContainerActionDocker:containerActionP
 const statusImpl=RUNTIME==='docker'?getStatusDocker:getStatusProcess;
 const logsImpl=RUNTIME==='docker'?getLogsDocker:getLogsProcess;
 const streamRuntimeLogsImpl=RUNTIME==='docker'?streamRuntimeLogsDocker:streamRuntimeLogsProcess;
-if(RUNTIME==='process'){recoverProcesses();void restoreFromControlPlane()}
+if(RUNTIME==='process'){recoverProcesses();restoreFromControlPlane().catch((e)=>console.log(`[OrbitHost worker] Boot restore threw: ${e&&e.message||e}`))}
+process.on('unhandledRejection',(reason)=>{try{console.log(`[OrbitHost worker] Unhandled rejection contained: ${reason&&reason.message||reason}`)}catch{}});
 
 app.get('/healthz',(req,res)=>res.json({ok:true,service:'orbithost-worker',bootId:BOOT_ID,runtime:RUNTIME}));
 app.use('/v1',auth);
@@ -673,7 +672,7 @@ const deployHandler=async(req,res)=>{
   }};
 app.post('/v1/deploy',upload.single('bundle'),(req,res)=>{if(req.body&&!req.body.projectId&&req.params&&req.params.id)req.body.projectId=req.params.id;return deployHandler(req,res)});
 app.post('/v1/projects/:id/deploy',upload.single('bundle'),(req,res)=>{req.body=req.body||{};if(!req.body.projectId)req.body.projectId=req.params.id;return deployHandler(req,res)});
-app.get('/v1/restore/run',async(req,res)=>{await restoreFromControlPlane();res.json(restoreState)});
+app.get('/v1/restore/run',async(req,res)=>{try{await restoreFromControlPlane()}catch(e){console.log(`[OrbitHost worker] Manual restore failed: ${e.message}`)}res.json(restoreState)});
 app.get('/v1/restore/status',(req,res)=>res.json(restoreState));
 app.post('/v1/projects/:id/action',async(req,res)=>{try{res.json(await actionImpl(req.params.id,req.body?.action))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/status',async(req,res)=>{try{res.json(await statusImpl(req.params.id))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
