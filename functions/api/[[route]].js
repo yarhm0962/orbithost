@@ -243,14 +243,23 @@ async function liveProjectView(env, p) {
   }
 }
 
+function toBytes(v) {
+  if (v instanceof Uint8Array) return v;
+  if (v instanceof ArrayBuffer) return new Uint8Array(v);
+  if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset || 0, v.byteLength || 0);
+  if (typeof v === 'string') return enc.encode(v);
+  return new Uint8Array(0);
+}
+
 async function loadBundle(env, bundleId) {
   if (!bundleId) return null;
   const parts = await rows(env.DB.prepare('SELECT seq, data FROM bundles WHERE bundle_id = ? ORDER BY seq').bind(bundleId));
+  const chunks = [];
   let length = 0;
-  for (const part of parts) length += part.data.byteLength;
+  for (const part of parts) { const c = toBytes(part.data); chunks.push(c); length += c.length; }
   const out = new Uint8Array(length);
   let offset = 0;
-  for (const part of parts) { out.set(new Uint8Array(part.data), offset); offset += part.data.byteLength; }
+  for (const c of chunks) { out.set(c, offset); offset += c.length; }
   return out;
 }
 
@@ -268,7 +277,9 @@ async function deployWithWorker(env, p, deploymentId) {
     form.set('repositoryUrl', p.repository_url || '');
   } else if (p.source_type === 'zip' && p.source_bundle) {
     const bundle = await loadBundle(env, p.source_bundle);
-    if (!bundle) throw new ApiError(400, 'The uploaded source archive is missing. Re-upload the project.');
+    if (!bundle || !bundle.length) throw new ApiError(400, 'The uploaded source archive is missing. Re-upload the project.');
+    const magic = Array.from(bundle.slice(0, 4)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    if (magic !== '504b0304') throw new ApiError(500, `Stored source archive failed its integrity check (${magic || 'empty'}). Re-upload the project.`);
     form.set('bundle', new Blob([bundle], { type: 'application/zip' }), `${p.id}.zip`);
   }
   return workerRequest(env, `/v1/projects/${p.id}/deploy`, { method: 'POST', body: form });
@@ -721,8 +732,7 @@ async function handle(request, env, method, path, url, ip) {
       await env.DB.prepare('UPDATE projects SET status=?,updated_at=? WHERE id=?').bind('failed', nowISO(), p.id).run();
       await addActivity(env, userId, p.id, 'deployment_failed', `${p.name} deployment failed.`);
       if (error instanceof ApiError) return json({ error: error.message }, error.status);
-      const stackLine = (error && error.stack ? error.stack.split('\n').slice(0, 3).join(' | ') : String(error));
-      return json({ error: (error && error.message) || 'Deployment failed.', name: error && error.name, at: stackLine }, 500);
+      return json({ error: (error && error.message) || 'Deployment failed.' }, 500);
     } finally { projectOperations.delete(p.id); }
   }
 
