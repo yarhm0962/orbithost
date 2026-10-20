@@ -2,6 +2,8 @@
 
 OrbitHost is a self-hostable web control plane for Python Discord bots. It ships with a real worker integration that builds and runs uploaded source in Docker containers, encrypted environment variables, container-backed status/resource reporting, persistent build logs, and live stdout/stderr streaming.
 
+The front-end uses the existing vanilla HTML/CSS/JavaScript stack. See [`UI-REDESIGN-REPORT.md`](./UI-REDESIGN-REPORT.md) for the responsive UI refresh, accessibility updates, before/after summary, and browser/device test checklist. The refreshed presentation is loaded from `public/ui-polish.css`; no third-party front-end dependency is required.
+
 **There is no demo mode, sample bot, seeded project, simulated deployment, random metric, or synthetic bot log.** The dashboard starts empty and shows actual records created by an account. The server removes old prototype/sample project records from an existing database on startup. A worker must be configured before real deployments can run.
 
 This repository is application source, not a pre-provisioned hosting service. Running bots 24/7 requires a reachable server, Docker, persistent storage, networking, monitoring, and a plan from your infrastructure provider. OrbitHost does not promise a hosting SLA.

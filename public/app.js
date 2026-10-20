@@ -3,7 +3,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const state = {
   user: null, csrf: '', config: { hostingMode: 'worker', workerReady: false, maxUploadMb: 1024, pythonVersions: ['3.10','3.11','3.12','3.13'] },
   dashboard: null, activePage: 'overview', activeProject: null, activeTab: 'overview', modal: null,
-  sidebarCollapsed: false, mobileNavOpen: false, projectSearch: '', logStream: 'runtime', logSearch: '',
+  sidebarCollapsed: false, mobileNavOpen: false, projectSearch: '', logStream: 'runtime', logSearch: '', modalReturnFocusSelector: '',
   logs: [], logCursor: null, logSeen: new Set(), logController: null, logStreamKey: '', logReconnectTimer: null, logStreamErrorShown: false, metrics: null, busy: false, authMode: 'login'
 };
 const iconPaths = {
@@ -122,20 +122,46 @@ function showToast(message, type='success', detail='') {
 }
 function setButtonBusy(button, label='Working…') { if(!button)return;button.disabled=true;button.dataset.original=button.innerHTML;button.innerHTML=`<span class="spinner"></span>${esc(label)}`; }
 function resetButton(button) { if(button){button.disabled=false;if(button.dataset.original){button.innerHTML=button.dataset.original;delete button.dataset.original;}} }
-function openModal(type, data = {}) { state.modal={type,...data};render();const field=$('.modal input:not([type=radio]):not([type=checkbox]),.modal select,.modal textarea');if(field)field.focus(); }
-function closeModal() { state.modal=null;render(); }
+// Keep keyboard focus predictable when the shell is re-rendered around a dialog.
+function focusSelectorFor(element) {
+  if (!element) return '';
+  if (element.id) return `#${CSS.escape(element.id)}`;
+  const selectors = [['data-action', element.dataset.action], ['data-nav', element.dataset.nav], ['data-project-tab', element.dataset.projectTab], ['data-edit-env', element.dataset.editEnv], ['data-delete-env', element.dataset.deleteEnv], ['data-open-project', element.dataset.openProject]];
+  const match = selectors.find(([, value]) => value);
+  return match ? `[${match[0]}=\"${CSS.escape(match[1])}\"]` : '';
+}
+function openModal(type, data = {}) {
+  state.modalReturnFocusSelector = focusSelectorFor(document.activeElement);
+  state.modal={type,...data};
+  render();
+  const dialog=$('.modal');
+  if(dialog) dialog.setAttribute('tabindex','-1');
+  const field=$('.modal input:not([type=radio]):not([type=checkbox]),.modal select,.modal textarea');
+  const firstControl=$('.modal button:not([disabled]),.modal a[href]');
+  (field || firstControl || dialog)?.focus({preventScroll:true});
+}
+function closeModal() {
+  state.modal=null;
+  render();
+  const returnTarget = state.modalReturnFocusSelector ? $(state.modalReturnFocusSelector) : null;
+  (returnTarget || $('.page-title') || $('#main-content'))?.focus({preventScroll:true});
+  state.modalReturnFocusSelector='';
+}
 function shell(content) {
   const navItems=[['overview','grid','Overview'],['projects','boxes','Projects'],['activity','activity','Activity'],['settings','settings','Settings']];
   const active=state.activePage==='project'?'projects':state.activePage;
   return `<div class="app-shell ${state.sidebarCollapsed?'sidebar-collapsed':''} ${state.mobileNavOpen?'mobile-nav-open':''}">
-    <aside class="sidebar" aria-label="Main navigation">
+    <!-- A real button backdrop is keyboard/screen-reader visible and closes the mobile drawer. -->
+    ${state.mobileNavOpen?'<button type="button" class="mobile-nav-backdrop" data-action="close-mobile-menu" aria-label="Close navigation"></button>':''}
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+    <aside class="sidebar" id="primary-navigation" aria-label="Main navigation">
       <div class="sidebar-top"><div class="brand-mark"><svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="13"/><ellipse cx="20" cy="20" rx="18" ry="7" transform="rotate(-35 20 20)"/><circle class="mark-dot" cx="31" cy="10" r="2.5"/></svg></div><div class="brand-copy"><div class="brand-name">OrbitHost</div><div class="brand-tagline">Bot infrastructure</div></div></div>
-      <div class="nav-label">Workspace</div><nav class="nav-list">${navItems.map(([id,ic,label])=>`<button class="nav-link ${active===id?'active':''}" data-nav="${id}" title="${label}">${icon(ic)}<span class="nav-text">${label}</span>${id==='projects'?`<span class="nav-count">${state.dashboard?.stats?.total||0}</span>`:''}</button>`).join('')}</nav>
+      <div class="nav-label">Workspace</div><nav class="nav-list">${navItems.map(([id,ic,label])=>`<button class="nav-link ${active===id?'active':''}" data-nav="${id}" title="${label}" ${active===id?'aria-current="page"':''}>${icon(ic)}<span class="nav-text">${label}</span>${id==='projects'?`<span class="nav-count">${state.dashboard?.stats?.total||0}</span>`:''}</button>`).join('')}</nav>
       <div class="nav-label">Resources</div><nav class="nav-list"><button class="nav-link" data-resource="docs">${icon('book')}<span class="nav-text">Setup guide</span>${icon('external')}</button><button class="nav-link" data-resource="worker">${icon('server')}<span class="nav-text">Worker status</span></button></nav>
       <div class="sidebar-bottom"><div class="worker-card"><div class="worker-card-top"><span class="worker-led" style="${state.config.workerReady?'background:var(--green)':'background:var(--red)'}"></span>${state.config.workerReady?'Worker connected':'Worker unavailable'}</div><p>${state.config.workerReady?'Container execution and live process logs are available.':'No live worker connection. Configure WORKER_URL and WORKER_TOKEN; deployments will fail clearly until the worker is reachable.'}</p><button class="text-link" data-nav="settings">Hosting configuration ${icon('chevronRight')}</button></div>
       <div class="user-mini"><div class="avatar">${esc(initials(state.user?.email))}</div><div class="user-mini-copy"><div class="user-email">${esc(state.user?.email||'Workspace user')}</div><div class="user-plan">Hosting workspace</div></div><button class="icon-button" title="Sign out" aria-label="Sign out" data-action="logout">${icon('logOut')}</button></div></div>
     </aside>
-    <main class="shell-main"><header class="topbar"><div class="topbar-left"><button class="icon-button mobile-menu" data-action="mobile-menu" aria-label="Open navigation">${icon('menu')}</button><button class="icon-button desktop-collapse" data-action="collapse-sidebar" aria-label="Collapse sidebar" title="Collapse sidebar">${icon('collapse')}</button><div class="topbar-divider"></div><div class="crumb">Workspace <span style="color:#596681;margin:0 6px">/</span> <span class="crumb-current">${esc(state.activePage==='project'?state.activeProject?.project?.name||'Project':state.activePage[0].toUpperCase()+state.activePage.slice(1))}</span></div></div>
+    <main class="shell-main" id="main-content" tabindex="-1"><header class="topbar"><div class="topbar-left"><button class="icon-button mobile-menu" data-action="mobile-menu" aria-label="${state.mobileNavOpen?'Close navigation':'Open navigation'}" aria-controls="primary-navigation" aria-expanded="${state.mobileNavOpen}">${icon('menu')}</button><button class="icon-button desktop-collapse" data-action="collapse-sidebar" aria-label="Collapse sidebar" title="Collapse sidebar">${icon('collapse')}</button><div class="topbar-divider"></div><div class="crumb">Workspace <span style="color:#596681;margin:0 6px">/</span> <span class="crumb-current">${esc(state.activePage==='project'?state.activeProject?.project?.name||'Project':state.activePage[0].toUpperCase()+state.activePage.slice(1))}</span></div></div>
       <div class="topbar-right"><label class="topbar-search">${icon('search')}<input id="global-search" type="search" placeholder="Find a project…" aria-label="Search projects" value="${esc(state.projectSearch)}"><span class="keycap">/</span></label><div class="topbar-divider"></div><button class="icon-button topbar-icon" data-resource="docs" title="Help and setup guide" aria-label="Help">${icon('help')}</button><button class="icon-button topbar-icon" data-nav="activity" title="Activity" aria-label="Activity">${icon('bell')}<span class="notification-dot"></span></button><div class="avatar">${esc(initials(state.user?.email))}</div></div></header>
       <div class="page-content">${content}</div></main>${state.modal?renderModal():''}</div>`;
 }
@@ -201,7 +227,7 @@ function renderDetail() {
   else if(tab==='logs') body=renderLogs();
   else if(tab==='environment') body=renderEnvironment(wrapper.environment||[]);
   else if(tab==='settings') body=renderProjectSettings(p);
-  return `${detailHead}<div class="project-tabs" role="tablist" aria-label="Project sections">${tabs.map(([id,label,ic])=>`<button role="tab" aria-selected="${tab===id}" class="project-tab ${tab===id?'active':''}" data-project-tab="${id}">${icon(ic)} ${label}</button>`).join('')}</div><div class="detail-tab-content">${body}</div>`;
+  return `${detailHead}<div class="project-tabs" role="tablist" aria-label="Project sections">${tabs.map(([id,label,ic])=>`<button role="tab" id="tab-${id}" aria-controls="project-tab-panel" tabindex="${tab===id?0:-1}" aria-selected="${tab===id}" class="project-tab ${tab===id?'active':''}" data-project-tab="${id}">${icon(ic)} ${label}</button>`).join('')}</div><div class="detail-tab-content" id="project-tab-panel" role="tabpanel" aria-labelledby="tab-${tab}" tabindex="0">${body}</div>`;
 }
 function renderDetailOverview(wrapper) {
   const p=wrapper.project, m=state.metrics||{status:p.status,cpuPercent:null,memoryMb:null,memoryLimitMb:null,uptime:null,mode:'unavailable'};
@@ -218,7 +244,7 @@ function renderDetailOverview(wrapper) {
 }
 function formatUptime(total) { total=Math.max(0,Number(total)||0);const d=Math.floor(total/86400),h=Math.floor((total%86400)/3600),m=Math.floor((total%3600)/60);if(d)return `${d}d ${h}h`;if(h)return `${h}h ${m}m`;return `${m}m`; }
 function renderDeployments(deployments) {
-  const rows=deployments.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Deployment</th><th>Status</th><th>Trigger</th><th>Duration</th><th>Created</th></tr></thead><tbody>${deployments.map(d=>`<tr><td><strong style="font-size:11px;color:#e3e8f7">#${d.sequence}</strong><div class="muted-cell" style="font-size:9px;margin-top:4px">${esc(d.summary)}</div></td><td>${statusPill(d.status)}</td><td>${esc(d.trigger)}</td><td>${duration(d.durationMs)}</td><td class="muted-cell">${prettyTime(d.createdAt)}</td></tr>`).join('')}</tbody></table></div>`:`<div class="empty-state"><div class="empty-art">${icon('rocket')}</div><div class="empty-title">No deployments yet</div><div class="empty-copy">Your first build and deployment record will appear here.</div><button class="button button-primary" data-action="deploy">${icon('rocket')} Deploy project</button></div>`;
+  const rows=deployments.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Deployment</th><th>Status</th><th>Trigger</th><th>Duration</th><th>Created</th></tr></thead><tbody>${deployments.map(d=>`<tr><td data-label="Deployment"><strong>#${d.sequence}</strong><div class="muted-cell deployment-summary">${esc(d.summary)}</div></td><td data-label="Status">${statusPill(d.status)}</td><td data-label="Trigger">${esc(d.trigger)}</td><td data-label="Duration">${duration(d.durationMs)}</td><td data-label="Created" class="muted-cell">${prettyTime(d.createdAt)}</td></tr>`).join('')}</tbody></table></div>`:`<div class="empty-state"><div class="empty-art">${icon('rocket')}</div><div class="empty-title">No deployments yet</div><div class="empty-copy">Your first build and deployment record will appear here.</div><button class="button button-primary" data-action="deploy">${icon('rocket')} Deploy project</button></div>`;
   return sectionPanel('Deployment history',`${deployments.length} recent deployments`,`<div class="inline-notice">${icon('info')} Build history records when a deploy was requested, its result, and its duration. Open Logs to inspect detailed output.</div>${rows}`,`<button class="button button-primary button-sm" data-action="deploy">${icon('rocket')} Deploy</button>`);
 }
 function renderLogLine(line) {
@@ -251,7 +277,7 @@ function appendLiveLog(line) {
 function renderLogs() {
   const entries=filteredLogs();
   const content=entries.length?entries.map(renderLogLine).join(''):`<div class="log-empty">${state.logSearch?'No log lines match that search.':'No log output yet. Deploy your project or wait for process output.'}</div>`;
-  return `<section class="panel"><div class="panel-head"><div><h2 class="panel-title">Build & runtime logs</h2><div class="panel-note">Live process output from the worker. Secret values are redacted; log history is not truncated by OrbitHost.</div></div><button class="button button-quiet button-sm" data-action="refresh-logs">${icon('refresh')} Reload history</button></div><div class="log-toolbar"><label class="visually-hidden" for="log-stream">Log stream</label><select class="select" id="log-stream"><option value="runtime" ${state.logStream==='runtime'?'selected':''}>Runtime logs</option><option value="build" ${state.logStream==='build'?'selected':''}>Build logs</option></select><label class="search-field">${icon('search')}<input id="log-search" type="search" value="${esc(state.logSearch)}" placeholder="Search received log output…" aria-label="Search log output"></label><span style="font-size:10px;color:#7e8ba6;white-space:nowrap">${entries.length} visible · ${state.logs.length} received</span></div><div class="log-output" id="log-output" role="log" aria-live="polite">${content}</div><div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:11px 14px;border-top:1px solid var(--line-soft);font-size:9px;color:#7c89a3"><span id="log-connection-state">Live stream starts when connected to the worker.</span><button class="plain-link" data-action="copy-logs">${icon('clipboard')} Copy visible logs</button></div></section>`;
+  return `<section class="panel"><div class="panel-head"><div><h2 class="panel-title">Build & runtime logs</h2><div class="panel-note">Live process output from the worker. Secret values are redacted; log history is not truncated by OrbitHost.</div></div><button class="button button-quiet button-sm" data-action="refresh-logs">${icon('refresh')} Reload history</button></div><div class="log-toolbar"><label class="visually-hidden" for="log-stream">Log stream</label><select class="select" id="log-stream"><option value="runtime" ${state.logStream==='runtime'?'selected':''}>Runtime logs</option><option value="build" ${state.logStream==='build'?'selected':''}>Build logs</option></select><label class="search-field">${icon('search')}<input id="log-search" type="search" value="${esc(state.logSearch)}" placeholder="Search received log output…" aria-label="Search log output"></label><span style="font-size:10px;color:#7e8ba6;white-space:nowrap">${entries.length} visible · ${state.logs.length} received</span></div><div class="log-output" id="log-output" role="region" aria-label="${state.logStream==='runtime'?'Runtime':'Build'} log output" aria-live="off">${content}</div><div class="log-footer"><span id="log-connection-state" role="status" aria-live="polite">Live stream starts when connected to the worker.</span><button class="plain-link" data-action="copy-logs">${icon('clipboard')} Copy visible logs</button></div></section>`;
 }
 function renderEnvironment(vars) {
   const rows=vars.length?`<div class="environment-list">${vars.map(v=>`<div class="env-row"><div class="env-key-icon">${icon('key')}</div><div class="env-copy"><div class="env-key">${esc(v.key)}</div><div class="env-hint">Updated ${prettyTime(v.updatedAt)} · encrypted at rest</div></div><div class="env-mask" aria-label="Secret value is hidden">••••••••</div><div class="env-actions"><button class="icon-button" data-edit-env="${esc(v.key)}" title="Rotate secret" aria-label="Rotate ${esc(v.key)}">${icon('edit')}</button><button class="icon-button" data-delete-env="${esc(v.key)}" title="Delete secret" aria-label="Delete ${esc(v.key)}">${icon('trash')}</button></div></div>`).join('')}</div>`:`<div class="empty-state"><div class="empty-art">${icon('key')}</div><div class="empty-title">No environment variables</div><div class="empty-copy">Store Discord bot tokens and API keys as encrypted secrets instead of committing them to your source code.</div><button class="button button-primary" data-action="add-env">${icon('plus')} Add variable</button></div>`;
@@ -268,7 +294,7 @@ function renderAuth() {
 function renderModal() {
   const m=state.modal;if(!m)return '';
   if(m.type==='new-project') {
-    return `<div class="modal-backdrop" data-dismiss="modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-header"><div><div class="modal-title" id="modal-title">Create a project</div><div class="modal-subtitle">Bring your bot source into OrbitHost and configure its runtime.</div></div><button class="icon-button" data-action="close-modal" aria-label="Close dialog">${icon('x')}</button></div><form data-form="create-project" id="create-project-form"><div class="modal-body"><div class="field"><label class="field-label" for="new-project-name">Project name</label><input id="new-project-name" class="field-input" name="name" maxlength="60" placeholder="my-discord-bot" pattern="[A-Za-z0-9][A-Za-z0-9 ._-]{0,59}" required><div class="field-hint">Use letters, numbers, spaces, dots, underscores, and hyphens.</div></div><div class="field" style="margin-top:17px"><span class="field-label">Choose your source</span><div class="source-choice"><label class="source-option"><input type="radio" name="sourceType" value="zip" checked><span><strong>${icon('upload')} Upload a ZIP</strong><span>Upload your bot's source archive.</span></span></label><label class="source-option"><input type="radio" name="sourceType" value="git"><span><strong>${icon('github')} Git repository</strong><span>Connect a public HTTPS URL.</span></span></label></div></div><div id="upload-source"><div class="upload-zone">${icon('upload')}<p><strong>Choose your source archive</strong></p><p>ZIP only · max ${state.config.maxUploadMb} MB · no unsafe paths or symbolic links</p><input type="file" name="bundle" id="source-bundle" accept=".zip,application/zip"></div><div class="field-hint">Include main.py or your chosen entry file. requirements.txt is installed automatically by the worker.</div></div><div id="git-source" hidden><div class="field"><label class="field-label" for="repo-url">Repository HTTPS URL</label><input class="field-input" name="repositoryUrl" id="repo-url" type="url" placeholder="https://github.com/you/your-bot.git"><div class="field-hint">Public repositories only in this starter. Do not put access tokens in the URL.</div></div></div><div class="field" style="margin-top:18px"><label class="field-label" for="new-python">Python version</label><select class="select" style="width:100%" id="new-python" name="pythonVersion">${(state.config.pythonVersions||['3.10','3.11','3.12','3.13']).map(v=>`<option value="${v}" ${v==='3.12'?'selected':''}>Python ${v}</option>`).join('')}</select></div><div class="field"><label class="field-label" for="new-build">Build command <span style="color:#8190aa;font-weight:400">(optional)</span></label><input class="field-input" name="buildCommand" id="new-build" maxlength="500" placeholder="e.g. python -m compileall ."><div class="field-hint">The worker installs requirements.txt automatically before this command.</div></div><div class="field"><label class="field-label" for="new-start">Start command</label><input class="field-input" name="startCommand" id="new-start" value="python main.py" maxlength="500" required></div><label class="check-row"><input type="checkbox" name="source-confirm" required><span>I trust this project source and its dependencies. I understand that deployment executes code in an isolated worker container.</span></label><div class="modal-footer"><button type="button" class="button button-quiet" data-action="close-modal">Cancel</button><button type="submit" class="button button-primary" id="create-project-submit">${icon('plus')} Create project</button></div></div></form></section></div>`;
+    return `<div class="modal-backdrop" data-dismiss="modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-header"><div><div class="modal-title" id="modal-title">Create a project</div><div class="modal-subtitle">Bring your bot source into OrbitHost and configure its runtime.</div></div><button class="icon-button" data-action="close-modal" aria-label="Close dialog">${icon('x')}</button></div><form data-form="create-project" id="create-project-form"><div class="modal-body"><div class="field"><label class="field-label" for="new-project-name">Project name</label><input id="new-project-name" class="field-input" name="name" maxlength="60" placeholder="my-discord-bot" pattern="[A-Za-z0-9][A-Za-z0-9 ._-]{0,59}" required><div class="field-hint">Use letters, numbers, spaces, dots, underscores, and hyphens.</div></div><div class="field" style="margin-top:17px"><span class="field-label">Choose your source</span><div class="source-choice"><label class="source-option selected"><input type="radio" name="sourceType" value="zip" checked><span><strong>${icon('upload')} Upload a ZIP</strong><span>Upload your bot's source archive.</span></span></label><label class="source-option"><input type="radio" name="sourceType" value="git"><span><strong>${icon('github')} Git repository</strong><span>Connect a public HTTPS URL.</span></span></label></div></div><div id="upload-source"><div class="upload-zone">${icon('upload')}<p><strong>Choose your source archive</strong></p><p>ZIP only · max ${state.config.maxUploadMb} MB · no unsafe paths or symbolic links</p><input type="file" name="bundle" id="source-bundle" accept=".zip,application/zip"></div><div class="field-hint">Include main.py or your chosen entry file. requirements.txt is installed automatically by the worker.</div></div><div id="git-source" hidden><div class="field"><label class="field-label" for="repo-url">Repository HTTPS URL</label><input class="field-input" name="repositoryUrl" id="repo-url" type="url" placeholder="https://github.com/you/your-bot.git"><div class="field-hint">Public repositories only in this starter. Do not put access tokens in the URL.</div></div></div><div class="field" style="margin-top:18px"><label class="field-label" for="new-python">Python version</label><select class="select" style="width:100%" id="new-python" name="pythonVersion">${(state.config.pythonVersions||['3.10','3.11','3.12','3.13']).map(v=>`<option value="${v}" ${v==='3.12'?'selected':''}>Python ${v}</option>`).join('')}</select></div><div class="field"><label class="field-label" for="new-build">Build command <span style="color:#8190aa;font-weight:400">(optional)</span></label><input class="field-input" name="buildCommand" id="new-build" maxlength="500" placeholder="e.g. python -m compileall ."><div class="field-hint">The worker installs requirements.txt automatically before this command.</div></div><div class="field"><label class="field-label" for="new-start">Start command</label><input class="field-input" name="startCommand" id="new-start" value="python main.py" maxlength="500" required></div><label class="check-row"><input type="checkbox" name="source-confirm" required><span>I trust this project source and its dependencies. I understand that deployment executes code in an isolated worker container.</span></label><div class="modal-footer"><button type="button" class="button button-quiet" data-action="close-modal">Cancel</button><button type="submit" class="button button-primary" id="create-project-submit">${icon('plus')} Create project</button></div></div></form></section></div>`;
   }
   if(m.type==='env') {
     return `<div class="modal-backdrop" data-dismiss="modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-header"><div><div class="modal-title" id="modal-title">${m.key?'Rotate secret':'Add environment variable'}</div><div class="modal-subtitle">Variable values are encrypted on the server and will not be revealed again in the UI.</div></div><button class="icon-button" data-action="close-modal" aria-label="Close dialog">${icon('x')}</button></div><form data-form="save-env"><div class="modal-body"><div class="field"><label class="field-label" for="env-key">Variable name</label><input class="field-input" id="env-key" name="key" maxlength="128" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="DISCORD_TOKEN" value="${esc(m.key||'')}" ${m.key?'readonly':''} required><div class="field-hint">Letters, numbers, and underscores; the first character cannot be a number.</div></div><div class="field"><label class="field-label" for="env-value">${m.key?'New value':'Value'}</label><input class="field-input" id="env-value" name="value" type="password" maxlength="8192" autocomplete="new-password" placeholder="${m.key?'Enter a new value to rotate this secret':'Paste the secret value'}" required><div class="field-hint">Line breaks are not supported. Existing secret values cannot be recovered from the dashboard.</div></div><div class="modal-footer"><button type="button" class="button button-quiet" data-action="close-modal">Cancel</button><button type="submit" class="button button-primary">${icon('lock')} Save encrypted secret</button></div></div></form></section></div>`;
@@ -284,6 +310,10 @@ function renderModal() {
 }
 function render() {
   const app=$('#app');if(!app)return;
+  // Preserve focus for stable inputs after a data refresh; state-driven search itself stays DOM-local.
+  const focusedId=document.activeElement?.id;
+  const selectionStart=typeof document.activeElement?.selectionStart==='number'?document.activeElement.selectionStart:null;
+  const selectionEnd=typeof document.activeElement?.selectionEnd==='number'?document.activeElement.selectionEnd:null;
   if(!state.user) { stopLiveLogs(); app.innerHTML=renderAuth(); }
   else {
     let content='';
@@ -295,7 +325,15 @@ function render() {
     else content=renderOverview();
     app.innerHTML=shell(content);
   }
-  const navButton=$('.mobile-menu');if(navButton)navButton.setAttribute('aria-expanded',String(state.mobileNavOpen));
+  if(focusedId) {
+    const replacement=document.getElementById(focusedId);
+    if(replacement) {
+      replacement.focus({preventScroll:true});
+      if(selectionStart!==null && typeof replacement.setSelectionRange==='function') {
+        try { replacement.setSelectionRange(selectionStart,selectionEnd); } catch {}
+      }
+    }
+  }
   if(state.user&&state.activePage==='project'&&state.activeTab==='logs') void connectLiveLogs();
   else stopLiveLogs();
 }
@@ -391,6 +429,18 @@ function navigate(page) {
   if(page!=='project')state.activeProject=null;
   render();
 }
+async function switchProjectTab(tab, focusTab=false) {
+  state.activeTab=tab;
+  if(state.activeProject?.project?.id) {
+    if(tab==='logs')await refreshLogs();
+    if(tab==='overview')await refreshMetrics();
+    await refreshProject().catch(()=>{});
+  }
+  render();
+  const activeTab=$(`.project-tab[data-project-tab="${CSS.escape(tab)}"]`);
+  activeTab?.scrollIntoView({inline:'center',block:'nearest',behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});
+  if(focusTab)activeTab?.focus({preventScroll:true});
+}
 async function loadProjectAfterAction(message) {
   await refreshDashboard();await refreshProject();if(state.activeTab==='logs')await refreshLogs();if(state.activeTab==='overview')await refreshMetrics();render();if(message)showToast(message,'success');
 }
@@ -400,13 +450,15 @@ async function handleClick(e) {
   if(target.dataset.authMode){state.authMode=target.dataset.authMode;render();return;}
   if(target.dataset.nav){navigate(target.dataset.nav);return;}
   if(target.dataset.openProject){await openProject(target.dataset.openProject);return;}
-  if(target.dataset.projectTab){state.activeTab=target.dataset.projectTab;if(state.activeProject?.project?.id){if(state.activeTab==='logs')await refreshLogs();if(state.activeTab==='overview')await refreshMetrics();await refreshProject().catch(()=>{});}render();document.querySelector('.project-tab.active')?.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});return;}
+  if(target.dataset.projectTab){await switchProjectTab(target.dataset.projectTab);return;}
   if(target.dataset.editEnv){openModal('env',{key:target.dataset.editEnv});return;}
   if(target.dataset.deleteEnv){openModal('confirm-delete-env',{key:target.dataset.deleteEnv});return;}
-  if(target.dataset.resource){openModal('docs');return;}
+  if(target.dataset.resource==='worker'){navigate('settings');return;}
+  if(target.dataset.resource==='docs'){openModal('docs');return;}
   const action=target.dataset.action;
   if(!action)return;
-  if(action==='mobile-menu'){state.mobileNavOpen=!state.mobileNavOpen;render();return;}
+  if(action==='mobile-menu'){state.mobileNavOpen=!state.mobileNavOpen;render();if(state.mobileNavOpen)$('.nav-link.active')?.focus({preventScroll:true});else $('.mobile-menu')?.focus({preventScroll:true});return;}
+  if(action==='close-mobile-menu'){state.mobileNavOpen=false;render();$('.mobile-menu')?.focus({preventScroll:true});return;}
   if(action==='collapse-sidebar'){if(innerWidth<=700){state.mobileNavOpen=!state.mobileNavOpen}else state.sidebarCollapsed=!state.sidebarCollapsed;render();return;}
   if(action==='new-project'){openModal('new-project');return;}
   if(action==='close-modal'){closeModal();return;}
@@ -455,10 +507,10 @@ document.addEventListener('change',e=>{
   if(e.target.matches('input[name="sourceType"]')){
     const git=e.target.value==='git';const upload=$('#upload-source'),repo=$('#git-source');if(upload)upload.hidden=git;if(repo)repo.hidden=!git;
     const zip=$('#source-bundle'),url=$('#repo-url');if(zip)zip.required=!git;if(url)url.required=git;
+    $$('.source-option').forEach(option=>option.classList.toggle('selected',option.contains(e.target)));
   }
   if(e.target.id==='log-stream'){state.logStream=e.target.value;state.logSearch=$('#log-search')?.value||'';state.logs=[];state.logCursor=null;state.logSeen=new Set();stopLiveLogs();refreshLogs().then(()=>render());}
 });
-let logSearchTimer;
 document.addEventListener('input',e=>{
   if(e.target.id==='global-search'){
     state.projectSearch=e.target.value;
@@ -496,9 +548,27 @@ document.addEventListener('submit',async e=>{
     if(type==='auth') {const alert=$('#auth-alert');if(alert){alert.textContent=error.message;alert.classList.add('visible')}}else showToast(error.message,'error');
   } finally {if(document.body.contains(submit))resetButton(submit)}
 });
-document.addEventListener('keydown',e=>{
+document.addEventListener('keydown',async e=>{
   if(e.key==='Escape'&&state.modal){closeModal();return;}
-  if(e.key==='Escape'&&state.mobileNavOpen){state.mobileNavOpen=false;render();return;}
+  if(e.key==='Escape'&&state.mobileNavOpen){state.mobileNavOpen=false;render();$('.mobile-menu')?.focus({preventScroll:true});return;}
+  // WCAG keyboard navigation for the project tablist.
+  const currentTab=e.target.closest?.('[role="tab"][data-project-tab]');
+  if(currentTab&&(e.key==='ArrowRight'||e.key==='ArrowLeft'||e.key==='Home'||e.key==='End')){
+    const tabs=$$('.project-tab[data-project-tab]');
+    const index=tabs.indexOf(currentTab);
+    const nextIndex=e.key==='Home'?0:e.key==='End'?tabs.length-1:(index+(e.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;
+    if(tabs[nextIndex]){e.preventDefault();await switchProjectTab(tabs[nextIndex].dataset.projectTab,true);}return;
+  }
+  // Keep keyboard focus inside an open modal until it is dismissed.
+  if(state.modal&&e.key==='Tab'){
+    const dialog=$('.modal');
+    const focusable=$$('button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),a[href],[tabindex]:not([tabindex="-1"])',dialog).filter(el=>el.getClientRects().length);
+    if(!focusable.length){e.preventDefault();dialog?.focus();return;}
+    const first=focusable[0],last=focusable[focusable.length-1];
+    if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}
+    else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
+    return;
+  }
   if(e.key==='/'&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)&&state.user){e.preventDefault();$('#global-search')?.focus();}
 });
 bootstrap();
