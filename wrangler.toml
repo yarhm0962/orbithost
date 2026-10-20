@@ -9,4 +9,4 @@ PBKDF2_ITERATIONS = "25000"
 [[d1_databases]]
 binding = "DB"
 database_name = "orbithost-db"
-database_id = "local-dev"
+database_id = "3ecacc56-c4fb-492b-a3a6-ee7c4ce9cc46"
