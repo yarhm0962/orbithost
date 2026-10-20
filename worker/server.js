@@ -474,6 +474,8 @@ async function deployProcess(body,file){
   await new Promise(r=>setTimeout(r,2500));
   if(!procs.has(id)){
     log('[OrbitHost worker] The start process exited immediately after start; marking this deployment failed.\n');
+    const failedMeta=readMeta(id);
+    if(failedMeta)writeMeta(id,{...failedMeta,autoStart:false});
     throw new Error('Deployment failed: the start process exited immediately after starting. Open the Logs tab for the exact error, fix it, and deploy again.');
   }
   log('[OrbitHost worker] Process started and stayed up.\n');
@@ -656,6 +658,45 @@ async function restoreFromControlPlane(){
     }
     console.log(`[OrbitHost worker] Boot restore complete: ${restored} project(s) restored, ${started} started.`);
 }
+const activeDeploys=new Set();
+const restartBackoff=new Map();
+const watchdogState={sweeps:0,lastSweepAt:null,restarts:[]};
+async function watchdogSweep(){
+  watchdogState.sweeps++;watchdogState.lastSweepAt=new Date().toISOString();
+  let dirs=[];
+  try{dirs=fs.readdirSync(PROJECTS,{withFileTypes:true}).filter(d=>d.isDirectory()).map(d=>d.name)}catch{return}
+  for(const id of dirs){
+    if(!validId(id))continue;
+    if(activeDeploys.has(id))continue;
+    if(procs.has(id)){restartBackoff.delete(id);continue}
+    const meta=readMeta(id);
+    if(!meta||!meta.startCommand||meta.autoStart===false)continue;
+    if(!fs.existsSync(projectPath(id)))continue;
+    const back=restartBackoff.get(id)||{n:0,lastAt:0};
+    const waitMs=Math.min(30000*Math.pow(2,back.n),600000);
+    if(Date.now()-back.lastAt<waitMs)continue;
+    restartBackoff.set(id,{n:back.n+1,lastAt:Date.now()});
+    const secrets=getSecrets(id);
+    const logger=runtimeLogger(id,secrets);
+    try{
+      logger.line(`[OrbitHost worker] Watchdog: the bot process is not running; restarting it automatically (recovery attempt ${back.n+1}).`);logger.end();
+      await spawnBot(id,secrets);
+      watchdogState.restarts.push({id,at:new Date().toISOString(),attempt:back.n+1,ok:true});
+      console.log(`[OrbitHost worker] Watchdog: restarted process ${id} (attempt ${back.n+1}).`);
+    }catch(e){
+      try{logger.line(`[OrbitHost worker] Watchdog: restart attempt failed: ${e.message}`);logger.end()}catch{}
+      watchdogState.restarts.push({id,at:new Date().toISOString(),attempt:back.n+1,ok:false,error:e.message});
+      console.log(`[OrbitHost worker] Watchdog: restart failed for ${id}: ${e.message}`);
+    }
+    if(watchdogState.restarts.length>200)watchdogState.restarts.splice(0,watchdogState.restarts.length-200);
+  }
+}
+if(RUNTIME==='process'){
+  const WATCHDOG_INTERVAL_MS=Math.max(15000,Number(process.env.WATCHDOG_INTERVAL_MS||30000));
+  const watchdogTimer=setInterval(()=>{watchdogSweep().catch(()=>{})},WATCHDOG_INTERVAL_MS);
+  watchdogTimer.unref?.();
+}
+
 const deployImpl=RUNTIME==='docker'?deployDocker:deployProcess;
 const actionImpl=RUNTIME==='docker'?dockerContainerActionDocker:containerActionProcess;
 const statusImpl=RUNTIME==='docker'?getStatusDocker:getStatusProcess;
@@ -668,17 +709,20 @@ app.get('/healthz',(req,res)=>res.json({ok:true,service:'orbithost-worker',bootI
 app.use('/v1',auth);
 app.get('/v1/healthz',(req,res)=>res.json({ok:true,service:'orbithost-worker',authenticated:true,bootId:BOOT_ID,runtime:RUNTIME}));
 const deployHandler=async(req,res)=>{
+  const depId=String(req.body?.projectId||'');
+  if(validId(depId))activeDeploys.add(depId);
   try{const result=await deployImpl(req.body,req.file);res.json(result)}catch(error){
     const id=String(req.body?.projectId||'');const oldSecrets=getSecrets(id);const incomingEnv=validateSecretsForRedaction(req.body?.envJson);const secrets=allSecretValues(oldSecrets,incomingEnv);
     if(validId(id))appendBuild(id,`\n[deployment error] ${redact(error.message,secrets)}\n`,secrets);
     const msg=/exit|docker|git|pip|build|clone|ZIP|repository|environment|variable|command|Python/i.test(error.message)?redact(error.message,secrets): 'Deployment failed. Check the worker build logs.';
     res.status(400).json({error:msg});
-  }};
+  }finally{if(validId(depId))activeDeploys.delete(depId)}};
 app.post('/v1/deploy',upload.single('bundle'),(req,res)=>{if(req.body&&!req.body.projectId&&req.params&&req.params.id)req.body.projectId=req.params.id;return deployHandler(req,res)});
 app.post('/v1/projects/:id/deploy',upload.single('bundle'),(req,res)=>{req.body=req.body||{};if(!req.body.projectId)req.body.projectId=req.params.id;return deployHandler(req,res)});
 app.get('/v1/restore/run',async(req,res)=>{try{await restoreFromControlPlane()}catch(e){console.log(`[OrbitHost worker] Manual restore failed: ${e.message}`)}res.json(restoreState)});
 app.get('/v1/restore/status',(req,res)=>res.json(restoreState));
-app.post('/v1/projects/:id/action',async(req,res)=>{try{res.json(await actionImpl(req.params.id,req.body?.action))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
+app.get('/v1/watchdog/status',(req,res)=>res.json({...watchdogState,activeDeploys:[...activeDeploys]}));
+app.post('/v1/projects/:id/action',async(req,res)=>{try{const result=await actionImpl(req.params.id,req.body?.action);if(req.body?.action==='start')restartBackoff.delete(req.params.id);res.json(result)}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/status',async(req,res)=>{try{res.json(await statusImpl(req.params.id))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/logs',async(req,res)=>{try{const stream=req.query.stream==='build'?'build':'runtime';res.json(await logsImpl(req.params.id,stream))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/logs/stream',(req,res)=>{
