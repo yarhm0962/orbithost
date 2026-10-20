@@ -483,6 +483,32 @@ async function handle(request, env, method, path, url, ip) {
     return json({ user: publicUser(user) });
   }
 
+  // ---- worker-only internal endpoints (Bearer WORKER_TOKEN) ----
+
+  if (path.startsWith('/internal/worker/') && method === 'GET') {
+    const auth = request.headers.get('authorization') || '';
+    if (!env.WORKER_TOKEN || auth !== `Bearer ${env.WORKER_TOKEN}`) return json({ error: 'Unauthorized.' }, 401);
+    if (path === '/internal/worker/restore') {
+      const list = await rows(env.DB.prepare("SELECT id, source_type, repository_url, python_version, build_command, start_command, status FROM projects WHERE is_sample = 0 ORDER BY created_at ASC"));
+      const aes = await aesKey(env);
+      const out = [];
+      for (const p of list) {
+        const envPairs = aes ? await readEnv(env, p.id, aes) : [];
+        out.push({ id: p.id, sourceType: p.source_type, repositoryUrl: p.repository_url || '', pythonVersion: p.python_version, buildCommand: p.build_command || '', startCommand: p.start_command || 'python main.py', status: p.status, env: Object.fromEntries(envPairs.map((x) => [x.key, x.value])) });
+      }
+      return json({ projects: out });
+    }
+    const bundleMatch = path.match(/^\/internal\/worker\/bundle\/([a-f0-9-]{36})$/i);
+    if (bundleMatch) {
+      const p = await first(env.DB.prepare('SELECT source_bundle, source_type FROM projects WHERE id = ?').bind(bundleMatch[1]));
+      if (!p || p.source_type !== 'zip' || !p.source_bundle) return json({ error: 'No stored source archive for this project.' }, 404);
+      const bundle = await loadBundle(env, p.source_bundle);
+      if (!bundle || !bundle.length) return json({ error: 'Stored source archive is missing. Re-upload the project.' }, 404);
+      return new Response(bundle, { status: 200, headers: { 'content-type': 'application/zip' } });
+    }
+    return json({ error: 'Not found.' }, 404);
+  }
+
   if (path === '/auth/register' && method === 'POST') {
     await authRateLimit(env, ip);
     checkCsrf();

@@ -585,12 +585,69 @@ function recoverProcesses(){
     });
   }
 }
+async function restoreFromControlPlane(){
+  const base=String(process.env.CONTROL_PLANE_URL||'').replace(/\/$/,'');
+  const token=process.env.WORKER_TOKEN||'';
+  if(!base||!token){console.log('[OrbitHost worker] Boot restore disabled: CONTROL_PLANE_URL not set.');return}
+  try{
+    const res=await fetch(`${base}/internal/worker/restore`,{headers:{authorization:`Bearer ${token}`},signal:AbortSignal.timeout(30000)});
+    if(!res.ok){console.log(`[OrbitHost worker] Boot restore skipped: control plane responded ${res.status}.`);return}
+    const data=await res.json();const projects=Array.isArray(data.projects)?data.projects:[];
+    if(!projects.length){console.log('[OrbitHost worker] Boot restore: no projects on file.');return}
+    let restored=0,started=0;
+    for(const p of projects){
+      const id=String(p.id||'');if(!validId(id))continue;
+      try{
+        const dir=projectPath(id);
+        const fresh=!fs.existsSync(metaPath(id));
+        if(fresh){
+          await fs.promises.rm(dir,{recursive:true,force:true});await fs.promises.mkdir(dir,{recursive:true,mode:0o700});
+          if(p.sourceType==='git'){
+            await run('git',['-c','core.hooksPath=/dev/null','-c','protocol.file.allow=never','clone','--depth','1','--no-recurse-submodules','--',String(p.repositoryUrl||''),dir],{timeout:GIT_TIMEOUT_MS,cleanEnv:true,env:{GIT_TERMINAL_PROMPT:'0',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'}});
+            await fs.promises.rm(path.join(dir,'.git'),{recursive:true,force:true});
+            await fs.promises.rm(path.join(dir,'Dockerfile'),{force:true});
+          }else if(p.sourceType==='zip'){
+            const res2=await fetch(`${base}/internal/worker/bundle/${id}`,{headers:{authorization:`Bearer ${token}`},signal:AbortSignal.timeout(60000)});
+            if(!res2.ok)throw new Error(`stored bundle fetch failed (${res2.status})`);
+            const buf=Buffer.from(await res2.arrayBuffer());
+            if(!(buf[0]===0x50&&buf[1]===0x4b))throw new Error('stored bundle is not a valid ZIP');
+            const tmp=path.join(DATA,`restore-${id}.zip`);
+            await fs.promises.writeFile(tmp,buf,{mode:0o600});
+            await extractZip(tmp,dir);await fs.promises.rm(tmp,{force:true});
+            await fs.promises.rm(path.join(dir,'Dockerfile'),{force:true});
+          }else{await fs.promises.rm(dir,{recursive:true,force:true});continue}
+        }
+        const envObj=(p.env&&typeof p.env==='object')?p.env:{};
+        await fs.promises.writeFile(secretPath(id),encrypt(envObj),{mode:0o600});
+        const startCommand=String(p.startCommand||'python main.py');
+        const prevMeta=readMeta(id);
+        const reqPath=path.join(dir,'requirements.txt');
+        const reqHash=fs.existsSync(reqPath)?sha256Buf(fs.readFileSync(reqPath)):null;
+        writeMeta(id,{startCommand,buildCommand:String(p.buildCommand||''),pythonVersion:String(p.pythonVersion||'3.12'),autoStart:prevMeta?prevMeta.autoStart!==false:true,reqHash});
+        const needVenv=Boolean(reqHash&&!fs.existsSync(path.join(venvPath(id),'bin','python'))||reqHash&&prevMeta&&prevMeta.reqHash!==reqHash&&!fs.existsSync(path.join(venvPath(id),'bin','python')));
+        if(needVenv){
+          try{
+            fs.mkdirSync(path.dirname(venvPath(id)),{recursive:true,mode:0o700});
+            await fs.promises.rm(venvPath(id),{recursive:true,force:true});
+            await run('python3',['-m','venv',venvPath(id)],{timeout:BUILD_TIMEOUT_MS});
+            await run(path.join(venvPath(id),'bin','pip'),['install','--no-cache-dir','--no-input','-r',reqPath],{timeout:BUILD_TIMEOUT_MS});
+          }catch(e){console.log(`[OrbitHost worker] Boot restore: venv build failed for ${id}: ${e.message}`)}
+        }
+        restored++;
+        if(p.status==='stopped'){continue}
+        if(prevMeta&&prevMeta.autoStart===false){continue}
+        await spawnBot(id,envObj).then(()=>{started++}).catch((e)=>{try{fs.appendFileSync(runtimeArchivePath(id),stampLine(`[OrbitHost worker] Boot restore: could not start process: ${e.message}`),{mode:0o600})}catch{}})
+      }catch(e){console.log(`[OrbitHost worker] Boot restore failed for project ${id}: ${e.message}`)}
+    }
+    console.log(`[OrbitHost worker] Boot restore complete: ${restored} project(s) restored, ${started} started.`);
+  }catch(e){console.log(`[OrbitHost worker] Boot restore failed: ${e.message}`)}
+}
 const deployImpl=RUNTIME==='docker'?deployDocker:deployProcess;
 const actionImpl=RUNTIME==='docker'?dockerContainerActionDocker:containerActionProcess;
 const statusImpl=RUNTIME==='docker'?getStatusDocker:getStatusProcess;
 const logsImpl=RUNTIME==='docker'?getLogsDocker:getLogsProcess;
 const streamRuntimeLogsImpl=RUNTIME==='docker'?streamRuntimeLogsDocker:streamRuntimeLogsProcess;
-if(RUNTIME==='process')recoverProcesses();
+if(RUNTIME==='process'){recoverProcesses();void restoreFromControlPlane()}
 
 app.get('/healthz',(req,res)=>res.json({ok:true,service:'orbithost-worker',bootId:BOOT_ID,runtime:RUNTIME}));
 app.use('/v1',auth);
