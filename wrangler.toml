@@ -1,0 +1,12 @@
+name = "orbithost"
+pages_build_output_dir = "public"
+compatibility_date = "2025-12-01"
+
+[vars]
+MAX_UPLOAD_MB = "8"
+PBKDF2_ITERATIONS = "25000"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "orbithost-db"
+database_id = "local-dev"

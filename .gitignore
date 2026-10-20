@@ -6,3 +6,5 @@ worker-data/
 *.sqlite-shm
 *.sqlite-wal
 uploads/
+.dev.vars
+.wrangler/
