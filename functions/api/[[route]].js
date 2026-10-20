@@ -721,7 +721,8 @@ async function handle(request, env, method, path, url, ip) {
       await env.DB.prepare('UPDATE projects SET status=?,updated_at=? WHERE id=?').bind('failed', nowISO(), p.id).run();
       await addActivity(env, userId, p.id, 'deployment_failed', `${p.name} deployment failed.`);
       if (error instanceof ApiError) return json({ error: error.message }, error.status);
-      throw error;
+      const stackLine = (error && error.stack ? error.stack.split('\n').slice(0, 3).join(' | ') : String(error));
+      return json({ error: (error && error.message) || 'Deployment failed.', name: error && error.name, at: stackLine }, 500);
     } finally { projectOperations.delete(p.id); }
   }
 
