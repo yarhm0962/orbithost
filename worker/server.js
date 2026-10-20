@@ -373,9 +373,22 @@ function runtimeLogger(id,secrets){
   };
 }
 function childEnv(dir,userEnv,id){
-  const venvBin=path.join(dir,'venv','bin');
+  const venvBin=path.join(venvPath(id),'bin');
   const base={PATH:`${venvBin}:${process.env.PATH||'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}`,HOME:'/tmp',LANG:'C.UTF-8',PYTHONUNBUFFERED:'1',ORBIT_DATA_DIR:path.join(DATA,`botdata-${id}`)};
   return {...base,...Object.fromEntries(Object.entries(userEnv||{}).filter(([k])=>!/^(WORKER_|NODE_)/.test(k)))};
+}
+
+function venvPath(id){return path.join(DATA,'venvs',id)}
+function sha256Buf(buf){return crypto.createHash('sha256').update(buf).digest('hex')}
+function startTargetFile(startCommand){const m=String(startCommand).match(/(?:^|[\s"'=;])([^\s"'=;&]+\.py)(?=$|[\s"'&;])/);return m?m[1]:null}
+function resolveStartCommand(dir,startCommand){
+  const target=startTargetFile(startCommand);
+  if(!target||fs.existsSync(path.join(dir,target)))return {startCommand,changed:false};
+  if(target.includes('/')||target.includes('..'))return {startCommand,changed:false,missing:target};
+  let files=[];try{files=fs.readdirSync(dir).filter(f=>f.endsWith('.py')&&fs.statSync(path.join(dir,f)).isFile()).sort()}catch{}
+  const alt=['bot.py','main.py','app.py','run.py','index.py'].find(c=>files.includes(c));
+  if(alt)return {startCommand:String(startCommand).replace(target,alt),changed:true,missing:target,files};
+  return {startCommand,changed:false,missing:target,files};
 }
 function spawnBot(id,secrets){
   const meta=readMeta(id);
@@ -383,6 +396,18 @@ function spawnBot(id,secrets){
   const dir=projectPath(id);
   if(procs.has(id))return Promise.resolve({status:'online'});
   if(!fs.existsSync(dir))return Promise.reject(new Error('Project source is missing on the worker. Deploy it again.'));
+  const pick=resolveStartCommand(dir,meta.startCommand);
+  if(pick.changed){
+    writeMeta(id,{...meta,startCommand:pick.startCommand});
+    meta.startCommand=pick.startCommand;
+    const loggerPick=runtimeLogger(id,secrets);
+    loggerPick.line(`[OrbitHost worker] Start file ${pick.missing} was not found in the project; using ${pick.startCommand} instead.`);loggerPick.end();
+  }else if(pick.missing){
+    const msg=`Start file ${pick.missing} was not found in the project source. Top-level Python files: ${(pick.files||[]).slice(0,12).join(', ')||'none'}. Fix the start command in Settings and deploy again.`;
+    const loggerMiss=runtimeLogger(id,secrets);
+    loggerMiss.line(`[OrbitHost worker] Process failed to start: ${msg}`);loggerMiss.end();
+    return Promise.reject(new Error(msg));
+  }
   const logger=runtimeLogger(id,secrets);
   const child=spawn('/bin/sh',['-lc',meta.startCommand],{cwd:dir,env:childEnv(dir,secrets,id),stdio:['ignore','pipe','pipe'],detached:true});
   const entry={child,startedAt:Date.now(),logger,lastSample:null};
@@ -417,24 +442,41 @@ async function deployProcess(body,file){
   const env=validateEnvironment(body.envJson);
   const dir=await ensureSource(body,file,id);
   const log=(chunk)=>appendBuild(id,chunk,env);
+  const pick=resolveStartCommand(dir,startCommand);
+  if(pick.changed){log(`[OrbitHost worker] Start file ${pick.missing} was not found in the project; using ${pick.startCommand} instead.\n`);startCommand=pick.startCommand}
+  else if(pick.missing){throw new Error(`Start file ${pick.missing} was not found in the project source. Top-level Python files: ${(pick.files||[]).slice(0,12).join(', ')||'none'}. Fix the start command and deploy again.`)}
   let hostPython='';
   try{hostPython=(await run('python3',['-c','import platform;print(platform.python_version())'],{timeout:20000})).stdout.trim()}catch{}
   log(`\n[OrbitHost worker] Process mode build. Requested Python ${version}; worker runtime Python ${hostPython||'unavailable'}.\n`);
-  await fs.promises.rm(path.join(dir,'venv'),{recursive:true,force:true});
-  if(fs.existsSync(path.join(dir,'requirements.txt'))){
-    log('[OrbitHost worker] Creating virtual environment…\n');
-    await loggedRun(id,'python3',['-m','venv',path.join(dir,'venv')],env,{cwd:dir,timeout:BUILD_TIMEOUT_MS});
-    log('[OrbitHost worker] Installing requirements.txt…\n');
-    await loggedRun(id,path.join(dir,'venv','bin','pip'),['install','--no-cache-dir','--no-input','-r',path.join(dir,'requirements.txt')],env,{cwd:dir,timeout:BUILD_TIMEOUT_MS});
+  const reqPath=path.join(dir,'requirements.txt');
+  const reqHash=fs.existsSync(reqPath)?sha256Buf(fs.readFileSync(reqPath)):null;
+  const prevMeta=readMeta(id);
+  const canReuse=Boolean(reqHash&&prevMeta&&prevMeta.reqHash===reqHash&&fs.existsSync(path.join(venvPath(id),'bin','python')));
+  if(canReuse){
+    log('[OrbitHost worker] requirements.txt is unchanged since the last deploy; reusing the existing environment (fast deploy).\n');
+  }else{
+    await fs.promises.rm(venvPath(id),{recursive:true,force:true});
+    if(fs.existsSync(reqPath)){
+      fs.mkdirSync(path.dirname(venvPath(id)),{recursive:true,mode:0o700});
+      log('[OrbitHost worker] Creating virtual environment…\n');
+      await loggedRun(id,'python3',['-m','venv',venvPath(id)],env,{cwd:dir,timeout:BUILD_TIMEOUT_MS});
+      log('[OrbitHost worker] Installing requirements.txt…\n');
+      await loggedRun(id,path.join(venvPath(id),'bin','pip'),['install','--no-cache-dir','--no-input','-r',reqPath],env,{cwd:dir,timeout:BUILD_TIMEOUT_MS});
+    }
   }
   if(buildCommand){log('[OrbitHost worker] Running build command…\n');await loggedRun(id,'/bin/sh',['-lc',buildCommand],env,{cwd:dir,timeout:BUILD_TIMEOUT_MS})}
   await stopProcess(id,10000);
   await fs.promises.writeFile(secretPath(id),encrypt(env),{mode:0o600});
-  writeMeta(id,{startCommand,buildCommand,pythonVersion:version,autoStart:true});
+  writeMeta(id,{startCommand,buildCommand,pythonVersion:version,autoStart:true,reqHash});
   fs.mkdirSync(path.join(DATA,`botdata-${id}`),{recursive:true,mode:0o700});
   log('\n[OrbitHost worker] Starting process…\n');
   await spawnBot(id,env);
-  log('[OrbitHost worker] Process started.\n');
+  await new Promise(r=>setTimeout(r,2500));
+  if(!procs.has(id)){
+    log('[OrbitHost worker] The start process exited immediately after start; marking this deployment failed.\n');
+    throw new Error('Deployment failed: the start process exited immediately after starting. Open the Logs tab for the exact error, fix it, and deploy again.');
+  }
+  log('[OrbitHost worker] Process started and stayed up.\n');
   return {status:'online',containerId:`orbithost-${id}`,pythonVersion:version,runtime:'process'};
 }
 async function containerActionProcess(id,action){
@@ -444,6 +486,7 @@ async function containerActionProcess(id,action){
     await stopProcess(id,6000).catch(()=>{});
     procs.delete(id);
     await fs.promises.rm(projectPath(id),{recursive:true,force:true});
+    await fs.promises.rm(venvPath(id),{recursive:true,force:true});
     await fs.promises.rm(path.join(DATA,`botdata-${id}`),{recursive:true,force:true});
     await fs.promises.rm(buildLogPath(id),{force:true});await fs.promises.rm(runtimeArchivePath(id),{force:true});await fs.promises.rm(secretPath(id),{force:true});await fs.promises.rm(metaPath(id),{force:true});
     return {status:'deleted'};
