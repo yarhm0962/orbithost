@@ -1,0 +1,28 @@
+{
+  "name": "orbithost-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A secure-first Discord bot hosting control plane with an optional isolated Docker worker.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "worker": "node worker/server.js",
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/server.js && node --check src/db.js && node --check src/security.js && node --check worker/server.js && node --check public/app.js && node --check test/security.test.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.3",
+    "express-rate-limit": "^8.7.1",
+    "express-session": "^1.19.0",
+    "helmet": "^8.3.0",
+    "multer": "^2.4.0",
+    "yauzl": "^3.4.0",
+    "better-sqlite3": "^13.0.3"
+  }
+}

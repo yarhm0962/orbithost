@@ -1,0 +1,40 @@
+services:
+  control-plane:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      PORT: 8080
+      DATABASE_PATH: /data/orbithost.sqlite
+      UPLOAD_DIR: /data/uploads
+    volumes:
+      - control-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Opt-in only. Run this on a dedicated worker VM, not beside sensitive services.
+  # Mounting docker.sock grants host-level control; restrict network access and credentials.
+  worker:
+    profiles: ["worker"]
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    env_file: .worker.env
+    environment:
+      WORKER_PORT: 8787
+      WORKER_DATA_DIR: /worker-data
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - worker-data:/worker-data
+    restart: unless-stopped
+    expose:
+      - "8787"
+
+volumes:
+  control-data:
+  worker-data:
