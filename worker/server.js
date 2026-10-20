@@ -409,7 +409,7 @@ function spawnBot(id,secrets){
     return Promise.reject(new Error(msg));
   }
   const logger=runtimeLogger(id,secrets);
-  const child=spawn('/bin/sh',['-lc',meta.startCommand],{cwd:dir,env:childEnv(dir,secrets,id),stdio:['ignore','pipe','pipe'],detached:true});
+  const child=spawn('/bin/sh',['-c',meta.startCommand],{cwd:dir,env:childEnv(dir,secrets,id),stdio:['ignore','pipe','pipe'],detached:true});
   const entry={child,startedAt:Date.now(),logger,lastSample:null};
   procs.set(id,entry);
   child.stdout.on('data',c=>{try{logger.write(c)}catch{}});
@@ -464,7 +464,7 @@ async function deployProcess(body,file){
       await loggedRun(id,path.join(venvPath(id),'bin','pip'),['install','--no-cache-dir','--no-input','-r',reqPath],env,{cwd:dir,timeout:BUILD_TIMEOUT_MS});
     }
   }
-  if(buildCommand){log('[OrbitHost worker] Running build command…\n');await loggedRun(id,'/bin/sh',['-lc',buildCommand],env,{cwd:dir,timeout:BUILD_TIMEOUT_MS})}
+  if(buildCommand){log('[OrbitHost worker] Running build command…\n');await loggedRun(id,'/bin/sh',['-c',buildCommand],env,{cwd:dir,timeout:BUILD_TIMEOUT_MS})}
   await stopProcess(id,10000);
   await fs.promises.writeFile(secretPath(id),encrypt(env),{mode:0o600});
   writeMeta(id,{startCommand,buildCommand,pythonVersion:version,autoStart:true,reqHash});
@@ -638,11 +638,15 @@ async function restoreFromControlPlane(){
         const needVenv=Boolean(reqHash&&!fs.existsSync(path.join(venvPath(id),'bin','python'))||reqHash&&prevMeta&&prevMeta.reqHash!==reqHash&&!fs.existsSync(path.join(venvPath(id),'bin','python')));
         if(needVenv){
           try{
+            const rlog=(chunk)=>{try{appendBuild(id,chunk,{})}catch{}};
             fs.mkdirSync(path.dirname(venvPath(id)),{recursive:true,mode:0o700});
             await fs.promises.rm(venvPath(id),{recursive:true,force:true});
+            rlog('\n[OrbitHost worker] Boot restore: rebuilding Python environment…\n');
             await run('python3',['-m','venv',venvPath(id)],{timeout:BUILD_TIMEOUT_MS});
+            rlog(`[OrbitHost worker] Boot restore: installing requirements.txt…\n`);
             await run(path.join(venvPath(id),'bin','pip'),['install','--no-cache-dir','--no-input','-r',reqPath],{timeout:BUILD_TIMEOUT_MS});
-          }catch(e){console.log(`[OrbitHost worker] Boot restore: venv build failed for ${id}: ${e.message}`)}
+            rlog('[OrbitHost worker] Boot restore: environment ready.\n');
+          }catch(e){console.log(`[OrbitHost worker] Boot restore: venv build failed for ${id}: ${e.message}`);try{appendBuild(id,`\n[OrbitHost worker] Boot restore: environment rebuild failed: ${e.message}\n`,{})}catch{}}
         }
         restored++;
         if(p.status==='stopped'){restoreState.results.push({id,ok:true,started:false,reason:'status stopped'});continue}
