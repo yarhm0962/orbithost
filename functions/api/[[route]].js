@@ -248,7 +248,8 @@ function toBytes(v) {
   if (v instanceof ArrayBuffer) return new Uint8Array(v);
   if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset || 0, v.byteLength || 0);
   if (typeof v === 'string') return enc.encode(v);
-  return new Uint8Array(0);
+  if (Array.isArray(v)) return new Uint8Array(v);
+  return null;
 }
 
 async function loadBundle(env, bundleId) {
@@ -256,7 +257,11 @@ async function loadBundle(env, bundleId) {
   const parts = await rows(env.DB.prepare('SELECT seq, data FROM bundles WHERE bundle_id = ? ORDER BY seq').bind(bundleId));
   const chunks = [];
   let length = 0;
-  for (const part of parts) { const c = toBytes(part.data); chunks.push(c); length += c.length; }
+  for (const part of parts) {
+    const c = toBytes(part.data);
+    if (c === null) throw new ApiError(500, `Stored source archive could not be read (chunk type ${part.data === null ? 'null' : typeof part.data}${Array.isArray(part.data) ? ' array' : ''}). Re-upload the project.`);
+    chunks.push(c); length += c.length;
+  }
   const out = new Uint8Array(length);
   let offset = 0;
   for (const c of chunks) { out.set(c, offset); offset += c.length; }
