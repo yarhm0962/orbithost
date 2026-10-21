@@ -232,15 +232,45 @@ async function workerRequest(env, route, options = {}, timeoutMs = Number(env.WO
 const STALE_DEPLOY_MS = 45 * 60 * 1000;
 async function sweepStaleDeploy(env, p) {
   if (!p || p.status !== 'deploying') return p;
+  const now = nowISO();
+  const latest = await first(env.DB.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC LIMIT 1').bind(p.id));
+  if (!latest || latest.status !== 'building') return p;
+  let deployState = null;
+  try { deployState = await workerRequest(env, `/v1/projects/${p.id}/deploy-state`, {}, 8000); } catch {}
+  const finished = deployState && deployState.state ? deployState.state : null;
+  const duration = Math.max(0, Date.now() - Date.parse(latest.created_at));
+  const successSummary = 'Build and runtime logs scanned; no fatal errors. Process is running.';
+  if (finished === 'deployed') {
+    let runtimeStatus = 'online';
+    try { const m = await workerRequest(env, `/v1/projects/${p.id}/status`, {}, 10000); if (['online', 'stopped', 'failed'].includes(m.status)) runtimeStatus = m.status; } catch {}
+    await env.DB.prepare("UPDATE deployments SET status='success',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+      .bind(successSummary, now, duration, latest.id).run();
+    await env.DB.prepare("UPDATE projects SET status=?,updated_at=?,last_deployed_at=? WHERE id=? AND status='deploying'").bind(runtimeStatus, now, now, p.id).run();
+    await addActivity(env, p.user_id, p.id, 'deployment_succeeded', `${p.name} deployment completed.`);
+    return { ...p, status: runtimeStatus };
+  }
+  if (finished === 'failed' || finished === 'canceled') {
+    await env.DB.prepare("UPDATE deployments SET status='failed',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+      .bind(finished === 'canceled' ? 'Deployment canceled: the project was deleted.' : 'Deployment failed on the worker. Check the build logs and try again.', now, duration, latest.id).run();
+    await env.DB.prepare("UPDATE projects SET status=?,updated_at=? WHERE id=? AND status='deploying'").bind(finished === 'canceled' ? 'stopped' : 'failed', now, p.id).run();
+    if (finished !== 'canceled') await addActivity(env, p.user_id, p.id, 'deployment_failed', `${p.name} deployment failed.`);
+    return { ...p, status: finished === 'canceled' ? 'stopped' : 'failed' };
+  }
   const started = Date.parse(p.updated_at || p.created_at || '');
   const age = Number.isFinite(started) ? Date.now() - started : 0;
   if (age < STALE_DEPLOY_MS) return p;
-  const latest = await first(env.DB.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC LIMIT 1').bind(p.id));
-  const now = nowISO();
-  if (latest && latest.status === 'building') {
-    await env.DB.prepare("UPDATE deployments SET status='failed',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
-      .bind('Deployment timed out: the worker stopped reporting progress. Check the build logs and try again.', now, Math.max(0, Date.now() - Date.parse(latest.created_at)), latest.id).run();
+  if (deployState && deployState.active) return p;
+  let runtimeStatus = null;
+  try { const m = await workerRequest(env, `/v1/projects/${p.id}/status`, {}, 10000); if (['online', 'stopped', 'failed', 'unknown'].includes(m.status)) runtimeStatus = m.status; } catch {}
+  if (runtimeStatus === 'online') {
+    await env.DB.prepare("UPDATE deployments SET status='success',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+      .bind(successSummary, now, duration, latest.id).run();
+    await env.DB.prepare("UPDATE projects SET status='online',updated_at=?,last_deployed_at=? WHERE id=? AND status='deploying'").bind(now, now, p.id).run();
+    await addActivity(env, p.user_id, p.id, 'deployment_succeeded', `${p.name} deployment completed.`);
+    return { ...p, status: 'online' };
   }
+  await env.DB.prepare("UPDATE deployments SET status='failed',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+    .bind('Deployment timed out: the worker stopped reporting progress. Check the build logs and try again.', now, duration, latest.id).run();
   await env.DB.prepare("UPDATE projects SET status='failed',updated_at=? WHERE id=? AND status='deploying'").bind(now, p.id).run();
   await addActivity(env, p.user_id, p.id, 'deployment_failed', `${p.name} deployment timed out and was marked failed.`);
   return { ...p, status: 'failed' };
@@ -536,11 +566,16 @@ async function handle(request, env, method, path, url, ip) {
     const signal = safeText(String(body.signal || ''), 24);
     const uptimeSec = Math.max(0, Math.floor(Number(body.uptimeSec) || 0));
     const fatalLine = safeText(String(body.fatalLine || ''), 240);
+    const reasonCode = safeText(String(body.reasonCode || ''), 40);
+    const memoryKilledMb = Math.max(0, Math.floor(Number(body.memoryKilledMb) || 0));
+    const memoryLimitMb = Math.max(0, Math.floor(Number(body.memoryLimitMb) || 0));
     const deploymentId = String(body.deploymentId || '');
     const crashed = code === null ? Boolean(signal) : code !== 0;
     if (!crashed) return json({ ok: true });
     const exitText = `Process exited ${code === null ? `on signal ${signal}` : `with exit code ${code}`}${uptimeSec ? ` after ${uptimeSec}s` : ''}.`;
-    const reason = `${exitText}${fatalLine ? ` Last fatal output: ${fatalLine}` : ''}`;
+    const reason = reasonCode === 'memory_limit'
+      ? `Process exceeded the ${memoryLimitMb || 512} MB memory limit of the Free plan${memoryKilledMb ? ` (was using about ${memoryKilledMb} MB)` : ''} and was stopped.`
+      : `${exitText}${fatalLine ? ` Last fatal output: ${fatalLine}` : ''}`;
     const aes = await aesKey(env);
     const secrets = aes ? (await readEnv(env, p.id, aes)).map((x) => x.value) : [];
     let deployment = null;
@@ -567,9 +602,51 @@ async function handle(request, env, method, path, url, ip) {
 
   // ---- worker-only internal endpoints (Bearer WORKER_TOKEN) ----
 
+  if (path === '/internal/worker/deploy-complete' && method === 'POST') {
+    const auth = request.headers.get('authorization') || '';
+    if (!env.WORKER_TOKEN || auth !== `Bearer ${env.WORKER_TOKEN}`) return json({ error: 'Unauthorized.' }, 401);
+    const body = await readJson(request);
+    const projectId = String(body.projectId || '');
+    if (!/^[a-f0-9-]{36}$/i.test(projectId)) return json({ error: 'Invalid project ID.' }, 400);
+    const p = await first(env.DB.prepare('SELECT * FROM projects WHERE id=?').bind(projectId));
+    if (!p) return json({ ok: true, note: 'Project no longer exists.' });
+    const outcome = String(body.outcome || '');
+    const deploymentId = String(body.deploymentId || '');
+    const summary = safeText(String(body.summary || ''), 500);
+    const runtimeStatus = ['online', 'stopped', 'failed', 'unknown'].includes(String(body.runtimeStatus)) ? String(body.runtimeStatus) : null;
+    if (!['deployed', 'failed', 'canceled'].includes(outcome)) return json({ error: 'Invalid outcome.' }, 400);
+    let deployment = null;
+    if (/^[a-f0-9-]{36}$/i.test(deploymentId)) deployment = await first(env.DB.prepare('SELECT * FROM deployments WHERE id=? AND project_id=?').bind(deploymentId, projectId));
+    if (!deployment) deployment = await first(env.DB.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC LIMIT 1').bind(projectId));
+    if (!deployment || deployment.status !== 'building') return json({ ok: true, note: 'Deployment already finalized.' });
+    const now = nowISO();
+    const aes = await aesKey(env);
+    const secrets = aes ? (await readEnv(env, projectId, aes)).map((x) => x.value) : [];
+    if (outcome === 'deployed') {
+      await env.DB.prepare("UPDATE deployments SET status='success',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+        .bind(maskSecrets(summary || 'Deployment completed; build and runtime logs scanned.', secrets), now, Math.max(0, Date.now() - Date.parse(deployment.created_at)), deployment.id).run();
+      await env.DB.prepare("UPDATE projects SET status=?,updated_at=?,last_deployed_at=? WHERE id=? AND status='deploying'")
+        .bind(runtimeStatus || 'online', now, now, projectId).run();
+      await addActivity(env, p.user_id, projectId, 'deployment_succeeded', `${p.name} deployment completed.`);
+    } else {
+      await env.DB.prepare("UPDATE deployments SET status='failed',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+        .bind(maskSecrets(summary || 'Deployment failed.', secrets), now, Math.max(0, Date.now() - Date.parse(deployment.created_at)), deployment.id).run();
+      await env.DB.prepare("UPDATE projects SET status=?,updated_at=? WHERE id=? AND status='deploying'")
+        .bind(outcome === 'canceled' ? 'stopped' : 'failed', now, projectId).run();
+      if (outcome !== 'canceled') await addActivity(env, p.user_id, projectId, 'deployment_failed', `${p.name} deployment failed.`);
+    }
+    return json({ ok: true });
+  }
+
   if (path.startsWith('/internal/worker/') && method === 'GET') {
     const auth = request.headers.get('authorization') || '';
     if (!env.WORKER_TOKEN || auth !== `Bearer ${env.WORKER_TOKEN}`) return json({ error: 'Unauthorized.' }, 401);
+    if (path.startsWith('/internal/worker/exists/')) {
+      const id = path.slice('/internal/worker/exists/'.length);
+      if (!/^[a-f0-9-]{36}$/i.test(id)) return json({ error: 'Invalid project ID.' }, 400);
+      const row = await first(env.DB.prepare('SELECT id FROM projects WHERE id=?').bind(id));
+      return json({ exists: Boolean(row) });
+    }
     if (path === '/internal/worker/restore') {
       const list = await rows(env.DB.prepare("SELECT id, source_type, repository_url, python_version, build_command, start_command, status FROM projects WHERE is_sample = 0 ORDER BY created_at ASC"));
       const aes = await aesKey(env);
@@ -771,6 +848,7 @@ async function handle(request, env, method, path, url, ip) {
       projectOperations.add(p.id);
       try {
         const deleteResult = await workerRequest(env, `/v1/projects/${p.id}/action`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'delete' }) });
+        await env.DB.prepare("UPDATE deployments SET status='failed',summary='Deployment canceled: the project was deleted.',finished_at=?,duration_ms=0 WHERE project_id=? AND status='building'").bind(nowISO(), p.id).run();
         await addActivity(env, userId, null, 'project_deleted', `${p.name} was deleted.${deleteResult && deleteResult.wasRunning ? ' Its running bot process was stopped.' : ''}`);
         await deleteBundle(env, p.source_bundle);
         await env.DB.prepare('DELETE FROM projects WHERE id=?').bind(p.id).run();
@@ -859,11 +937,11 @@ async function handle(request, env, method, path, url, ip) {
         if (['online', 'stopped', 'failed', 'unknown'].includes(measured.status)) runtimeStatus = measured.status;
       } catch {}
       const duration = Date.now() - started;
-      const summary = runtimeStatus === 'online' ? 'Container deployed and process is running.'
+      const summary = runtimeStatus === 'online' ? 'Build and runtime logs scanned; no fatal errors. Process is running.'
         : runtimeStatus === 'stopped' ? 'Container was created, but its process is not running. Inspect runtime logs.'
         : 'Container deployment completed; runtime status could not be confirmed.';
-      await env.DB.prepare('UPDATE deployments SET status=?,summary=?,finished_at=?,duration_ms=? WHERE id=?')
-        .bind('success', summary, nowISO(), duration, deployment.id).run();
+      await env.DB.prepare("UPDATE deployments SET status='success',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+        .bind(summary, nowISO(), duration, deployment.id).run();
       await env.DB.prepare('UPDATE projects SET status=?,updated_at=?,last_deployed_at=? WHERE id=?').bind(runtimeStatus, nowISO(), nowISO(), p.id).run();
       await addActivity(env, userId, p.id, 'deployment_succeeded', `${p.name} deployment completed; runtime status is ${runtimeStatus}.`);
       const message = runtimeStatus === 'online' ? 'Deployment completed and the process is running.'
@@ -880,8 +958,8 @@ async function handle(request, env, method, path, url, ip) {
       const duration = Date.now() - started;
       const aes = await aesKey(env);
       const secrets = aes ? (await readEnv(env, p.id, aes)).map((x) => x.value) : [];
-      await env.DB.prepare('UPDATE deployments SET status=?,summary=?,finished_at=?,duration_ms=? WHERE id=?')
-        .bind('failed', maskSecrets(error && error.message ? error.message : 'Deployment failed.', secrets), nowISO(), duration, deployment.id).run();
+      await env.DB.prepare("UPDATE deployments SET status='failed',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+        .bind(maskSecrets(error && error.message ? error.message : 'Deployment failed.', secrets), nowISO(), duration, deployment.id).run();
       await env.DB.prepare('UPDATE projects SET status=?,updated_at=? WHERE id=?').bind('failed', nowISO(), p.id).run();
       await addActivity(env, userId, p.id, 'deployment_failed', `${p.name} deployment failed.`);
       if (error instanceof ApiError) return json({ error: error.message }, error.status);

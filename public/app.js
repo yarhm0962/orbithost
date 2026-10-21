@@ -77,7 +77,7 @@ function prettyTime(date) {
 }
 function duration(ms) { if (ms == null) return '—'; if (ms < 1000) return `${ms} ms`; return `${(ms/1000).toFixed(1)}s`; }
 function statusPill(status) {
-  const map={online:['Online','online'],stopped:['Stopped','stopped'],deploying:['Deploying','deploying'],building:['Building','building'],failed:['Failed','failed'],success:['Ready','online']};
+  const map={online:['Online','online'],stopped:['Stopped','stopped'],deploying:['Deploying','deploying'],building:['Building','building'],failed:['Failed','failed'],success:['Deployed','online']};
   const [label,cls]=map[status]||[status||'Unknown','stopped'];
   return `<span class="status-pill status-${cls}"><span class="status-dot"></span>${label}</span>`;
 }

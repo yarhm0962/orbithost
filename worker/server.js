@@ -89,7 +89,7 @@ function createBuildLogWriter(id,secrets={}){
 }
 async function loggedRun(id,command,args,secrets,options={}){
   const writer=createBuildLogWriter(id,secrets);
-  try{return await run(command,args,{...options,onOutput:(chunk,channel)=>writer.push(chunk,channel)})}
+  try{return await run(command,args,{...options,onOutput:(chunk,channel)=>{writer.push(chunk,channel);for(const line of String(chunk).split(/\r?\n/))recordBuildFatal(id,line)}})}
   finally{writer.flush()}
 }
 function run(command,args,{cwd,env,timeout=180000,onOutput,cleanEnv=false,captureLimit=200000}={}){
@@ -455,6 +455,7 @@ function requiredEnvScan(dir,provided){
 }
 
 function spawnBot(id,secrets,deploymentId){
+  if(deletedProjects.has(id))return Promise.reject(new Error('Deployment aborted: the project was deleted.'));
   const meta=readMeta(id);
   if(!meta||!meta.startCommand)return Promise.reject(new Error('No start command recorded for this project. Deploy it first.'));
   const dir=projectPath(id);
@@ -498,7 +499,7 @@ function spawnBot(id,secrets,deploymentId){
         }else writeMeta(id,{...meta,consecutiveFastExits:n});
       }else if(meta&&meta.startCommand&&uptimeSec>=60000&&meta.consecutiveFastExits){writeMeta(id,{...meta,consecutiveFastExits:0})}
     }catch{}
-    reportProcessExit(id,{projectId:id,exitCode:code===null?null:code,signal:signal||'',uptimeSec,deploymentId:entry.deploymentId||'',fatalLine});
+    reportProcessExit(id,{projectId:id,exitCode:code===null?null:code,signal:signal||'',uptimeSec,deploymentId:entry.deploymentId||'',fatalLine,reasonCode:entry.memoryKilled?'memory_limit':'',memoryKilledMb:entry.memoryKilled?entry.memoryKilled.mb:null,memoryLimitMb:entry.memoryKilled?entry.memoryKilled.limitMb:null});
   });
   child.on('error',(error)=>{try{logger.line(`[OrbitHost worker] Process failed to start: ${error.message}.`);logger.end()}catch{}});
   return Promise.resolve({status:'online'});
@@ -533,6 +534,7 @@ async function killProjectStragglers(id){
 }
 async function deployProcess(body,file){
   const id=String(body.projectId||'');if(!validId(id))throw new Error('Invalid project ID.');
+  deployBuildFatals.set(id,[]);
   const version=String(body.pythonVersion||'3.12');if(!VERSIONS.has(version))throw new Error('Unsupported Python version.');
   const buildCommand=String(body.buildCommand||'').slice(0,500);let startCommand=String(body.startCommand||'python main.py').trim().slice(0,500);
   if(!startCommand)throw new Error('Start command is required.');
@@ -575,16 +577,30 @@ async function deployProcess(body,file){
   writeMeta(id,{startCommand,buildCommand,pythonVersion:version,autoStart:true,reqHash});
   fs.mkdirSync(path.join(DATA,`botdata-${id}`),{recursive:true,mode:0o700});
   log('\n[OrbitHost worker] Starting process…\n');
+  if(deletedProjects.has(id))throw new Error('Deployment aborted: the project was deleted while this deployment was running.');
   await spawnBot(id,env,String(body.deploymentId||''));
   await new Promise(r=>setTimeout(r,2500));
-  if(deletedProjects.has(id))throw new Error('Deployment aborted: the project was deleted while this deployment was running.');
+  if(deletedProjects.has(id)){
+    try{await stopProcess(id,4000)}catch{}
+    writeDeployState(id,String(body.deploymentId||''),'canceled');
+    void reportDeployComplete(id,{deploymentId:String(body.deploymentId||''),outcome:'canceled',summary:'Deployment canceled: the project was deleted.'});
+    deployBuildFatals.delete(id);
+    throw new Error('Deployment aborted: the project was deleted while this deployment was running.');
+  }
   if(!procs.has(id)){
     log('[OrbitHost worker] The start process exited immediately after start; marking this deployment failed.\n');
     const failedMeta=readMeta(id);
     if(failedMeta)writeMeta(id,{...failedMeta,autoStart:false});
+    writeDeployState(id,String(body.deploymentId||''),'failed','stopped');
+    void reportDeployComplete(id,{deploymentId:String(body.deploymentId||''),outcome:'failed',runtimeStatus:'stopped',summary:'Deployment failed: the start process exited immediately after starting. Open the Logs tab for the exact error, fix it, and deploy again.'});
+    deployBuildFatals.delete(id);
     throw new Error('Deployment failed: the start process exited immediately after starting. Open the Logs tab for the exact error, fix it, and deploy again.');
   }
   log('[OrbitHost worker] Process started and stayed up.\n');
+  const buildFatals=(deployBuildFatals.get(id)||[]).slice(0,5);
+  writeDeployState(id,String(body.deploymentId||''),'deployed','online');
+  void reportDeployComplete(id,{deploymentId:String(body.deploymentId||''),outcome:'deployed',runtimeStatus:'online',buildFatals,summary:buildFatals.length?'Deployment completed; the process is running. Build log warnings were recorded; check the build logs.':'Build and runtime logs scanned; no fatal errors. The process is running.'});
+  deployBuildFatals.delete(id);
   return {status:'online',containerId:`orbithost-${id}`,pythonVersion:version,runtime:'process'};
 }
 async function containerActionProcess(id,action){
@@ -600,6 +616,7 @@ async function containerActionProcess(id,action){
     await fs.promises.rm(path.join(DATA,`botdata-${id}`),{recursive:true,force:true});
     await fs.promises.rm(buildLogPath(id),{force:true});await fs.promises.rm(runtimeArchivePath(id),{force:true});await fs.promises.rm(secretPath(id),{force:true});await fs.promises.rm(metaPath(id),{force:true});
     const stragglers=await killProjectStragglers(id);
+    setTimeout(()=>{void (async()=>{if(procs.has(id)){await stopProcess(id,4000).catch(()=>{})}try{await killProjectStragglers(id)}catch{}})();},2500).unref?.();
     return {status:'deleted',wasRunning,killed:stragglers||0};
   }
   if(!['start','stop','restart'].includes(action))throw new Error('Unsupported action.');
@@ -611,6 +628,60 @@ async function containerActionProcess(id,action){
   writeMeta(id,{...meta,autoStart:true});
   await spawnBot(id,secrets);
   return {status:'online'};
+}
+// ---- Free plan limits (no paid plans exist yet) ----
+const PLAN_LIMITS={free:{memoryMb:512}};
+function planMemoryMb(){const plan=PLAN_LIMITS.free;return plan?plan.memoryMb:512}
+function buildFatalInfo(line){
+  const t=String(line||'').replace(/\x1b\[[0-9;]*m/g,'').trim();
+  if(!t)return null;
+  if(/^(ERROR:\s|error:\s|npm ERR!|fatal:\s)/.test(t))return t;
+  if(/^(ModuleNotFoundError|ImportError|SyntaxError|IndentationError|NameError|AttributeError|TypeError|FileNotFoundError|PermissionError|ValueError)\b/.test(t))return t;
+  return null;
+}
+const deployBuildFatals=new Map();
+function recordBuildFatal(id,line){const arr=deployBuildFatals.get(id);if(!arr)return;const f=buildFatalInfo(line);if(f&&arr.length<40)arr.push(f.slice(0,240))}
+function deployStatePath(id){return path.join(DATA,`deploystate-${id}.json`)}
+function writeDeployState(id,deploymentId,state,runtimeStatus){try{fs.writeFileSync(deployStatePath(id),JSON.stringify({deploymentId:deploymentId||'',state,runtimeStatus:runtimeStatus||null,at:new Date().toISOString()}),{mode:0o600})}catch{}}
+function readDeployState(id){try{const j=JSON.parse(fs.readFileSync(deployStatePath(id),'utf8'));if(j&&['deployed','failed','canceled'].includes(j.state))return j}catch{}return null}
+async function reportDeployComplete(id,payload){
+  const base=String(process.env.CONTROL_PLANE_URL||'').replace(/\/$/,'');
+  const token=process.env.WORKER_TOKEN||'';
+  if(!base||!token)return;
+  for(let attempt=1;attempt<=3;attempt++){
+    try{
+      const res=await fetch(`${base}/api/internal/worker/deploy-complete`,{method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json','user-agent':'Mozilla/5.0 (compatible; OrbitHostWorker/1.0)'},body:JSON.stringify({projectId:id,...payload}),signal:AbortSignal.timeout(10000)});
+      if(res.ok)return;
+      console.log(`[OrbitHost worker] Deploy-complete report rejected (${res.status}) for ${id}.`);
+    }catch(e){console.log(`[OrbitHost worker] Deploy-complete report failed (attempt ${attempt}) for ${id}: ${e.message}`)}
+    if(attempt<3)await new Promise(r=>setTimeout(r,5000));
+  }
+}
+async function projectExistsRemote(id){
+  const base=String(process.env.CONTROL_PLANE_URL||'').replace(/\/$/,'');
+  const token=process.env.WORKER_TOKEN||'';
+  if(!base||!token)return {ok:false,exists:null};
+  for(let attempt=1;attempt<=2;attempt++){
+    try{
+      const res=await fetch(`${base}/api/internal/worker/exists/${id}`,{headers:{authorization:`Bearer ${token}`,'user-agent':'Mozilla/5.0 (compatible; OrbitHostWorker/1.0)'},signal:AbortSignal.timeout(10000)});
+      if(res.ok){const j=await res.json().catch(()=>null);if(j&&typeof j.exists==='boolean')return {ok:true,exists:j.exists}}
+    }catch{}
+    if(attempt<2)await new Promise(r=>setTimeout(r,4000));
+  }
+  return {ok:false,exists:null};
+}
+function groupRssMb(id){
+  const marker=projectPath(id);let total=0;
+  let pids=[];try{pids=fs.readdirSync('/proc').filter(n=>/^\d+$/.test(n)).map(Number)}catch{return 0}
+  for(const pid of pids){
+    try{
+      const cmd=fs.readFileSync(`/proc/${pid}/cmdline`,'utf8');
+      if(!cmd||!cmd.includes(marker))continue;
+      const rss=fs.readFileSync(`/proc/${pid}/status`,'utf8').match(/VmRSS:\s+(\d+)\s+kB/);
+      if(rss)total+=Number(rss[1])/1024;
+    }catch{}
+  }
+  return total;
 }
 function resolveMainPid(pid){
   try{
@@ -626,7 +697,7 @@ function resolveMainPid(pid){
 async function getStatusProcess(id){
   if(!validId(id))throw new Error('Invalid project ID.');
   const entry=procs.get(id);
-  if(!entry)return {status:'stopped',cpuPercent:0,memoryMb:0,memoryLimitMb:null,uptime:0,mode:'process'};
+  if(!entry)return {status:'stopped',cpuPercent:0,memoryMb:0,memoryLimitMb:planMemoryMb(),uptime:0,mode:'process',plan:'free'};
   const pid=resolveMainPid(entry.child.pid);let cpuPercent=null,memoryMb=null;
   try{
     const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8').split(' ');
@@ -637,7 +708,7 @@ async function getStatusProcess(id){
     const rss=fs.readFileSync(`/proc/${pid}/status`,'utf8').match(/VmRSS:\s+(\d+)\s+kB/);
     if(rss)memoryMb=Math.round(Number(rss[1])/1024);
   }catch{}
-  return {status:'online',cpuPercent,memoryMb,memoryLimitMb:Math.round(os.totalmem()/1048576),uptime:Math.max(0,Math.floor((Date.now()-entry.startedAt)/1000)),mode:'process'};
+  return {status:'online',cpuPercent,memoryMb,memoryLimitMb:planMemoryMb(),uptime:Math.max(0,Math.floor((Date.now()-entry.startedAt)/1000)),mode:'process',plan:'free'};
 }
 async function getLogsProcess(id,stream){
   if(!validId(id))throw new Error('Invalid project ID.');
@@ -700,13 +771,39 @@ function recoverProcesses(){
     const id=m[1];const meta=readMeta(id);
     if(!meta||meta.autoStart===false)continue;
     if(!fs.existsSync(projectPath(id)))continue;
-    void spawnBot(id,getSecrets(id)).then(()=>{
-      try{fs.appendFileSync(runtimeArchivePath(id),stampLine('[OrbitHost worker] Worker restarted; recorded process restarted automatically.'),{mode:0o600})}catch{}
-    }).catch((error)=>{
-      try{fs.appendFileSync(runtimeArchivePath(id),stampLine(`[OrbitHost worker] Auto-start failed: ${error.message}`),{mode:0o600})}catch{}
-    });
+    void (async()=>{
+      const existsCheck=await projectExistsRemote(id);
+      if(existsCheck.ok&&!existsCheck.exists){
+        try{await fs.promises.rm(projectPath(id),{recursive:true,force:true});await fs.promises.rm(venvPath(id),{recursive:true,force:true});await fs.promises.rm(secretPath(id),{force:true});await fs.promises.rm(metaPath(id),{force:true})}catch{}
+        return;
+      }
+      if(!existsCheck.ok){try{fs.appendFileSync(runtimeArchivePath(id),stampLine('[OrbitHost worker] Auto-start skipped: the control plane could not confirm the project still exists.'),{mode:0o600})}catch{}return}
+      void spawnBot(id,getSecrets(id)).then(()=>{
+        try{fs.appendFileSync(runtimeArchivePath(id),stampLine('[OrbitHost worker] Worker restarted; recorded process restarted automatically.'),{mode:0o600})}catch{}
+      }).catch((error)=>{
+        try{fs.appendFileSync(runtimeArchivePath(id),stampLine(`[OrbitHost worker] Auto-start failed: ${error.message}`),{mode:0o600})}catch{}
+      });
+    })();
   }
 }
+const memoryWatchdogState={lastRunAt:null,kills:[]};
+const memoryTimer=setInterval(()=>{
+  memoryWatchdogState.lastRunAt=new Date().toISOString();
+  for(const [id,entry] of [...procs.entries()]){
+    if(entry.stopRequested||entry.memoryKilled)continue;
+    let mb=0;try{mb=groupRssMb(id)}catch{}
+    const limit=planMemoryMb();
+    if(mb>limit){
+      entry.memoryKilled={mb:Math.round(mb),limitMb:limit};
+      memoryWatchdogState.kills.push({id,mb:Math.round(mb),at:memoryWatchdogState.lastRunAt});
+      if(memoryWatchdogState.kills.length>50)memoryWatchdogState.kills.shift();
+      try{const lg=runtimeLogger(id,getSecrets(id));lg.line(`[OrbitHost worker] Process stopped: memory usage ${Math.round(mb)} MB exceeded the ${limit} MB memory limit of the Free plan.`);lg.end()}catch{}
+      try{process.kill(-entry.child.pid,'SIGKILL')}catch{try{entry.child.kill('SIGKILL')}catch{}}
+      try{for(const pid of fs.readdirSync('/proc').filter(n=>/^\d+$/.test(n)).map(Number)){const cmd=fs.readFileSync(`/proc/${pid}/cmdline`,'utf8');if(cmd&&cmd.includes(projectPath(id))&&pid!==process.pid){try{process.kill(-pid,'SIGKILL')}catch{try{process.kill(pid,'SIGKILL')}catch{}}}}}catch{}
+    }
+  }
+},10000);
+memoryTimer.unref?.();
 const restoreState={ranAt:null,attempts:[],results:[]};
 async function restoreFromControlPlane(){
   const base=String(process.env.CONTROL_PLANE_URL||'').replace(/\/$/,'');
@@ -773,6 +870,13 @@ async function restoreFromControlPlane(){
         restored++;
         if(p.status==='stopped'){restoreState.results.push({id,ok:true,started:false,reason:'status stopped'});continue}
         if(prevMeta&&prevMeta.autoStart===false){restoreState.results.push({id,ok:true,started:false,reason:'user stopped'});continue}
+        const existsCheck=await projectExistsRemote(id);
+        if(existsCheck.ok&&!existsCheck.exists){
+          try{await fs.promises.rm(dir,{recursive:true,force:true});await fs.promises.rm(venvPath(id),{recursive:true,force:true});await fs.promises.rm(secretPath(id),{force:true});await fs.promises.rm(metaPath(id),{force:true})}catch{}
+          restoreState.results.push({id,ok:true,started:false,reason:'Project was deleted; restore skipped it.'});
+          continue;
+        }
+        if(!existsCheck.ok){restoreState.results.push({id,ok:true,started:false,reason:'Could not confirm the project still exists with the control plane; not auto-starting.'});continue}
         await spawnBot(id,envObj).then(()=>{started++;restoreState.results.push({id,ok:true,started:true})}).catch((e)=>{try{fs.appendFileSync(runtimeArchivePath(id),stampLine(`[OrbitHost worker] Boot restore: could not start process: ${e.message}`),{mode:0o600})}catch{};restoreState.results.push({id,ok:true,started:false,error:e.message})})
       }catch(e){restoreState.results.push({id,ok:false,error:e.message});console.log(`[OrbitHost worker] Boot restore failed for project ${id}: ${e.message}`);continue}
     }
@@ -836,13 +940,21 @@ const deployHandler=async(req,res)=>{
     const id=String(req.body?.projectId||'');const oldSecrets=getSecrets(id);const incomingEnv=validateSecretsForRedaction(req.body?.envJson);const secrets=allSecretValues(oldSecrets,incomingEnv);
     if(validId(id))appendBuild(id,`\n[deployment error] ${redact(error.message,secrets)}\n`,secrets);
     const msg=/exit|docker|git|pip|build|clone|ZIP|repository|environment|variable|command|Python/i.test(error.message)?redact(error.message,secrets): 'Deployment failed. Check the worker build logs.';
+    if(validId(id)){
+      const prevDeployState=readDeployState(id);
+      const canceled=Boolean(prevDeployState&&prevDeployState.state==='canceled');
+      writeDeployState(id,String(req.body?.deploymentId||''),canceled?'canceled':'failed');
+      void reportDeployComplete(id,{deploymentId:String(req.body?.deploymentId||''),outcome:canceled?'canceled':'failed',runtimeStatus:canceled?'stopped':'failed',summary:canceled?'Deployment canceled: the project was deleted.':msg});
+      deployBuildFatals.delete(id);
+    }
     res.status(400).json({error:msg});
   }finally{if(validId(depId))activeDeploys.delete(depId)}};
 app.post('/v1/deploy',upload.single('bundle'),(req,res)=>{if(req.body&&!req.body.projectId&&req.params&&req.params.id)req.body.projectId=req.params.id;return deployHandler(req,res)});
 app.post('/v1/projects/:id/deploy',upload.single('bundle'),(req,res)=>{req.body=req.body||{};if(!req.body.projectId)req.body.projectId=req.params.id;return deployHandler(req,res)});
 app.get('/v1/restore/run',async(req,res)=>{try{await restoreFromControlPlane()}catch(e){console.log(`[OrbitHost worker] Manual restore failed: ${e.message}`)}res.json(restoreState)});
 app.get('/v1/restore/status',(req,res)=>res.json(restoreState));
-app.get('/v1/watchdog/status',(req,res)=>res.json({...watchdogState,activeDeploys:[...activeDeploys]}));
+app.get('/v1/watchdog/status',(req,res)=>res.json({...watchdogState,memory:memoryWatchdogState,activeDeploys:[...activeDeploys]}));
+app.get('/v1/projects/:id/deploy-state',(req,res)=>{const id=req.params.id;if(!validId(id))return res.status(400).json({error:'Invalid project ID.'});const state=readDeployState(id);res.json({active:activeDeploys.has(id),state})});
 app.get('/v1/procs',(req,res)=>res.json({processes:[...procs.entries()].map(([id,e])=>({id,pid:e&&e.child?e.child.pid:null}))}));
 app.post('/v1/projects/:id/action',async(req,res)=>{try{const result=await actionImpl(req.params.id,req.body?.action);if(req.body?.action==='start')restartBackoff.delete(req.params.id);res.json(result)}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/status',async(req,res)=>{try{res.json(await statusImpl(req.params.id))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
