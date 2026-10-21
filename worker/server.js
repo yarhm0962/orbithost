@@ -671,13 +671,24 @@ async function projectExistsRemote(id){
   }
   return {ok:false,exists:null};
 }
+function procInProject(id,pid){
+  const dir=projectPath(id);
+  try{
+    const cmd=fs.readFileSync(`/proc/${pid}/cmdline`,'utf8');
+    if(cmd&&cmd.includes(dir))return true;
+  }catch{}
+  try{
+    const cwd=fs.readlinkSync(`/proc/${pid}/cwd`);
+    if(cwd===dir||cwd.startsWith(dir+'/'))return true;
+  }catch{}
+  return false;
+}
 function groupRssMb(id){
-  const marker=projectPath(id);let total=0;
+  let total=0;
   let pids=[];try{pids=fs.readdirSync('/proc').filter(n=>/^\d+$/.test(n)).map(Number)}catch{return 0}
   for(const pid of pids){
     try{
-      const cmd=fs.readFileSync(`/proc/${pid}/cmdline`,'utf8');
-      if(!cmd||!cmd.includes(marker))continue;
+      if(!procInProject(id,pid))continue;
       const rss=fs.readFileSync(`/proc/${pid}/status`,'utf8').match(/VmRSS:\s+(\d+)\s+kB/);
       if(rss)total+=Number(rss[1])/1024;
     }catch{}
@@ -802,7 +813,7 @@ const memoryTimer=setInterval(()=>{
       if(memoryWatchdogState.kills.length>50)memoryWatchdogState.kills.shift();
       try{const lg=runtimeLogger(id,getSecrets(id));lg.line(`[OrbitHost worker] Process stopped: memory usage ${Math.round(mb)} MB exceeded the Free plan memory budget (effective limit ${limit} MB on this worker).`);lg.end()}catch{}
       try{process.kill(-entry.child.pid,'SIGKILL')}catch{try{entry.child.kill('SIGKILL')}catch{}}
-      try{for(const pid of fs.readdirSync('/proc').filter(n=>/^\d+$/.test(n)).map(Number)){const cmd=fs.readFileSync(`/proc/${pid}/cmdline`,'utf8');if(cmd&&cmd.includes(projectPath(id))&&pid!==process.pid){try{process.kill(-pid,'SIGKILL')}catch{try{process.kill(pid,'SIGKILL')}catch{}}}}}catch{}
+      try{for(const pid of fs.readdirSync('/proc').filter(n=>/^\d+$/.test(n)).map(Number)){if(pid===process.pid)continue;if(procInProject(id,pid)){try{process.kill(-pid,'SIGKILL')}catch{try{process.kill(pid,'SIGKILL')}catch{}}}}}catch{}
     }
   }
 },1000);
