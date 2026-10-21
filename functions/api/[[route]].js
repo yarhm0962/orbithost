@@ -834,7 +834,7 @@ async function handle(request, env, method, path, url, ip) {
   if (segments[0] === 'projects' && segments[2] === 'deploy' && method === 'POST') {
     const userId = requireAuth();
     checkCsrf();
-    const p = await ownerProject(env, userId, segments[1]);
+    let p = await ownerProject(env, userId, segments[1]);
     if (!p) return json({ error: 'Project not found.' }, 404);
     p = await sweepStaleDeploy(env, p);
     if (p.status === 'deploying' || projectOperations.has(p.id)) return json({ error: 'Another operation is already in progress for this project.' }, 409);
