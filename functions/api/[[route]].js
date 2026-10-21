@@ -739,6 +739,8 @@ async function handle(request, env, method, path, url, ip) {
     const gmailError = validateGmail(email);
     if (gmailError) return json({ error: gmailError }, 400);
     if (await first(env.DB.prepare('SELECT 1 FROM users WHERE email = ?').bind(email))) return json({ error: 'An account with that Gmail address is already registered.' }, 409);
+    const gmailCanon = gmailCanonicalLocal(email);
+    if (gmailCanon && gmailCanon !== email.slice(0, email.indexOf('@')) && await first(env.DB.prepare("SELECT 1 FROM users WHERE email LIKE '%@gmail.com' AND LOWER(REPLACE(SUBSTR(email,1,INSTR(email,'@')-1),'.','')) = ?").bind(gmailCanon))) return json({ error: 'An account with that Gmail address is already registered.' }, 409);
     const usernameError = validateUsername(username);
     if (usernameError) return json({ error: usernameError }, 400);
     if (await first(env.DB.prepare('SELECT 1 FROM users WHERE username_lower = ?').bind(username.toLowerCase()))) return json({ error: 'That username is already taken.' }, 409);
