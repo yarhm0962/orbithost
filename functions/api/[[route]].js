@@ -229,9 +229,28 @@ async function workerRequest(env, route, options = {}, timeoutMs = Number(env.WO
   } finally { clearTimeout(timer); }
 }
 
-async function liveProjectView(env, p) {
+const STALE_DEPLOY_MS = 45 * 60 * 1000;
+async function sweepStaleDeploy(env, p) {
+  if (!p || p.status !== 'deploying') return p;
+  const started = Date.parse(p.updated_at || p.created_at || '');
+  const age = Number.isFinite(started) ? Date.now() - started : 0;
+  if (age < STALE_DEPLOY_MS) return p;
+  const latest = await first(env.DB.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC LIMIT 1').bind(p.id));
+  const now = nowISO();
+  if (latest && latest.status === 'building') {
+    await env.DB.prepare("UPDATE deployments SET status='failed',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+      .bind('Deployment timed out: the worker stopped reporting progress. Check the build logs and try again.', now, Math.max(0, Date.now() - Date.parse(latest.created_at)), latest.id).run();
+  }
+  await env.DB.prepare("UPDATE projects SET status='failed',updated_at=? WHERE id=? AND status='deploying'").bind(now, p.id).run();
+  await addActivity(env, p.user_id, p.id, 'deployment_failed', `${p.name} deployment timed out and was marked failed.`);
+  return { ...p, status: 'failed' };
+}
+
+async function liveProjectView(env, p, collect) {
+  p = await sweepStaleDeploy(env, p);
   try {
     const measured = await workerRequest(env, `/v1/projects/${p.id}/status`, {}, 15000);
+    if (collect && measured && measured.status === 'online' && Number.isFinite(Number(measured.uptime))) collect.push(Math.max(0, Number(measured.uptime)));
     if (p.status === 'deploying') return projectView(env, p);
     const measuredStatus = ['online', 'stopped', 'failed', 'unknown'].includes(measured.status) ? measured.status : 'unknown';
     await env.DB.prepare("UPDATE projects SET status=? WHERE id=? AND status <> 'deploying'").bind(measuredStatus, p.id).run();
@@ -504,6 +523,48 @@ async function handle(request, env, method, path, url, ip) {
     return json({ user: publicUser(user) });
   }
 
+  if (path === '/internal/worker/exit' && method === 'POST') {
+    const auth = request.headers.get('authorization') || '';
+    if (!env.WORKER_TOKEN || auth !== `Bearer ${env.WORKER_TOKEN}`) return json({ error: 'Unauthorized.' }, 401);
+    const body = await readJson(request);
+    const projectId = String(body.projectId || '');
+    if (!/^[a-f0-9-]{36}$/i.test(projectId)) return json({ error: 'Invalid project ID.' }, 400);
+    const p = await first(env.DB.prepare('SELECT * FROM projects WHERE id=?').bind(projectId));
+    if (!p) return json({ ok: true, note: 'Project no longer exists.' });
+    const codeRaw = Number(body.exitCode);
+    const code = body.exitCode === null || body.exitCode === undefined || !Number.isFinite(codeRaw) ? null : codeRaw;
+    const signal = safeText(String(body.signal || ''), 24);
+    const uptimeSec = Math.max(0, Math.floor(Number(body.uptimeSec) || 0));
+    const fatalLine = safeText(String(body.fatalLine || ''), 240);
+    const deploymentId = String(body.deploymentId || '');
+    const crashed = code === null ? Boolean(signal) : code !== 0;
+    if (!crashed) return json({ ok: true });
+    const exitText = `Process exited ${code === null ? `on signal ${signal}` : `with exit code ${code}`}${uptimeSec ? ` after ${uptimeSec}s` : ''}.`;
+    const reason = `${exitText}${fatalLine ? ` Last fatal output: ${fatalLine}` : ''}`;
+    const aes = await aesKey(env);
+    const secrets = aes ? (await readEnv(env, p.id, aes)).map((x) => x.value) : [];
+    let deployment = null;
+    if (/^[a-f0-9-]{36}$/i.test(deploymentId)) deployment = await first(env.DB.prepare('SELECT * FROM deployments WHERE id=? AND project_id=?').bind(deploymentId, projectId));
+    if (!deployment) deployment = await first(env.DB.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC LIMIT 1').bind(projectId));
+    const now = nowISO();
+    if (p.status === 'deploying') {
+      if (deployment && deployment.status === 'building') {
+        await env.DB.prepare("UPDATE deployments SET status='failed',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+          .bind(maskSecrets(`Deployment failed: ${reason}`, secrets), now, Math.max(0, Date.now() - Date.parse(deployment.created_at)), deployment.id).run();
+      }
+      await env.DB.prepare("UPDATE projects SET status='failed',updated_at=? WHERE id=? AND status='deploying'").bind(now, projectId).run();
+      await addActivity(env, p.user_id, projectId, 'deployment_failed', `${p.name} deployment failed: ${exitText}`);
+    } else if (deployment && deployment.status === 'success' && deployment.finished_at && Date.now() - Date.parse(deployment.finished_at) < 5 * 60 * 1000) {
+      await env.DB.prepare("UPDATE deployments SET status='failed',summary=? WHERE id=?").bind(maskSecrets(`Runtime crash: ${reason}`, secrets), deployment.id).run();
+      await env.DB.prepare("UPDATE projects SET status='failed',updated_at=? WHERE id=? AND status <> 'deploying'").bind(now, projectId).run();
+      await addActivity(env, p.user_id, projectId, 'deployment_failed', `${p.name} crashed after deployment: ${exitText}`);
+    } else {
+      await addActivity(env, p.user_id, projectId, 'deployment_failed', `${p.name} process exited unexpectedly: ${exitText}`);
+      await env.DB.prepare("UPDATE projects SET status='failed',updated_at=? WHERE id=? AND status='online'").bind(now, projectId).run();
+    }
+    return json({ ok: true });
+  }
+
   // ---- worker-only internal endpoints (Bearer WORKER_TOKEN) ----
 
   if (path.startsWith('/internal/worker/') && method === 'GET') {
@@ -600,7 +661,8 @@ async function handle(request, env, method, path, url, ip) {
     const userId = requireAuth();
     const projectRows = await rows(env.DB.prepare('SELECT * FROM projects WHERE user_id = ? ORDER BY updated_at DESC').bind(userId));
     const projects = [];
-    for (const p of projectRows) projects.push(await liveProjectView(env, p));
+    const onlineUptimes = [];
+    for (const p of projectRows) projects.push(await liveProjectView(env, p, onlineUptimes));
     const count = (status) => projects.filter((p) => p.status === status).length;
     const activity = (await rows(env.DB.prepare('SELECT a.id,a.action,a.message,a.created_at,p.name AS project_name FROM activities a LEFT JOIN projects p ON p.id=a.project_id WHERE a.user_id=? ORDER BY a.id DESC LIMIT 8').bind(userId)))
       .map((a) => ({ id: a.id, action: a.action, message: a.message, createdAt: a.created_at, projectName: a.project_name }));
@@ -608,7 +670,7 @@ async function handle(request, env, method, path, url, ip) {
     return json({
       projects, activity,
       recentDeployments: deploys.map((d) => ({ ...deploymentView(d), projectName: d.project_name })),
-      stats: { total: projects.length, online: count('online'), stopped: count('stopped'), deploying: count('deploying'), uptime: null },
+      stats: { total: projects.length, online: count('online'), stopped: count('stopped'), deploying: count('deploying'), uptime: onlineUptimes.reduce((a, b) => a + b, 0) },
       hostingMode: 'worker'
     });
   }
@@ -665,10 +727,11 @@ async function handle(request, env, method, path, url, ip) {
 
   if (segments[0] === 'projects' && segments.length === 2) {
     const userId = requireAuth();
-    const p = await ownerProject(env, userId, segments[1]);
+    let p = await ownerProject(env, userId, segments[1]);
     if (!p) return json({ error: 'Project not found.' }, 404);
 
     if (method === 'GET') {
+      p = await sweepStaleDeploy(env, p);
       let view = p;
       try {
         const measured = await workerRequest(env, `/v1/projects/${p.id}/status`, {}, 15000);
@@ -773,14 +836,21 @@ async function handle(request, env, method, path, url, ip) {
     checkCsrf();
     const p = await ownerProject(env, userId, segments[1]);
     if (!p) return json({ error: 'Project not found.' }, 404);
+    p = await sweepStaleDeploy(env, p);
     if (p.status === 'deploying' || projectOperations.has(p.id)) return json({ error: 'Another operation is already in progress for this project.' }, 409);
     const started = Date.now();
     const deployment = await addDeploy(env, p.id, 'building', 'Deployment is being prepared.');
     await env.DB.prepare('UPDATE projects SET status=?,updated_at=? WHERE id=?').bind('deploying', nowISO(), p.id).run();
     await addActivity(env, userId, p.id, 'deployment_started', `${p.name} deployment started.`);
     projectOperations.add(p.id);
+    const deployTimeoutMs = Math.max(60000, Number(env.DEPLOY_TIMEOUT_MS || 30 * 60 * 1000));
+    let deployTimer;
     try {
-      const result = await deployWithWorker(env, p, deployment.id);
+      const result = await Promise.race([
+        deployWithWorker(env, p, deployment.id),
+        new Promise((_, reject) => { deployTimer = setTimeout(() => reject(new ApiError(504, 'Deployment timed out: the worker stopped responding. Check the build logs and try again.')), deployTimeoutMs); })
+      ]);
+      if (deployTimer) clearTimeout(deployTimer);
       const still = await first(env.DB.prepare('SELECT id FROM projects WHERE id=?').bind(p.id));
       if (!still) return json({ error: 'Project was deleted during its deployment.' }, 409);
       let runtimeStatus = 'unknown';
@@ -896,6 +966,7 @@ async function handle(request, env, method, path, url, ip) {
     const userId = requireAuth();
     const p = await ownerProject(env, userId, segments[1]);
     if (!p) return json({ error: 'Project not found.' }, 404);
+    await sweepStaleDeploy(env, p);
     try {
       const measured = await workerRequest(env, `/v1/projects/${p.id}/status`);
       if (p.status !== 'deploying' && measured.status && ['online', 'stopped', 'failed', 'unknown'].includes(measured.status))

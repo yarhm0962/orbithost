@@ -362,10 +362,10 @@ const metaPath=(id)=>path.join(SECRETS,`${id}.meta.json`);
 function readMeta(id){if(!validId(id))return null;try{return safeJson(fs.readFileSync(metaPath(id),'utf8'))}catch{return null}}
 function writeMeta(id,meta){fs.writeFileSync(metaPath(id),JSON.stringify(meta),{mode:0o600})}
 function stampLine(text){return `${new Date().toISOString()} ${text}\n`}
-function runtimeLogger(id,secrets){
+function runtimeLogger(id,secrets,onLine){
   const stream=fs.createWriteStream(runtimeArchivePath(id),{flags:'a',mode:0o600});
   let pending='';const dec=new StringDecoder('utf8');
-  const emit=(raw)=>{const line=raw.replace(/\r$/,'');if(line.trim())stream.write(stampLine(redact(line,secrets)))};
+  const emit=(raw)=>{const line=raw.replace(/\r$/,'');if(line.trim()){if(onLine){try{onLine(line)}catch{}}stream.write(stampLine(redact(line,secrets)))}};
   return {
     write(chunk){pending+=dec.write(chunk);let i;while((i=pending.indexOf('\n'))>=0){emit(pending.slice(0,i));pending=pending.slice(i+1)}},
     line(text){stream.write(stampLine(redact(String(text),secrets)))},
@@ -390,7 +390,71 @@ function resolveStartCommand(dir,startCommand){
   if(alt)return {startCommand:String(startCommand).replace(target,alt),changed:true,missing:target,files};
   return {startCommand,changed:false,missing:target,files};
 }
-function spawnBot(id,secrets){
+
+// --- failure detection: genuine crash signals only, never ordinary warnings ---
+function fatalLineInfo(line){
+  const t=String(line||'').replace(/\x1b\[[0-9;]*m/g,'').trim();
+  if(!t||t.startsWith('[OrbitHost worker]'))return null;
+  if(/^(Traceback \(most recent call last\)|During handling of the above exception|The above exception was the direct cause)/i.test(t))return t;
+  if(/^(Uncaught exception|Unhandled promise rejection|unhandledRejection|FATAL\b|ERR_[A-Z0-9_]+\b)/i.test(t))return t;
+  if(/^(?:[A-Za-z_][\w.]*\.)?[A-Z][A-Za-z_]*?(?:Error|Exception|Interrupt|Exit)\b/.test(t))return t;
+  return null;
+}
+function reportProcessExit(id,info){
+  const base=String(process.env.CONTROL_PLANE_URL||'').replace(/\/$/,'');
+  const token=process.env.WORKER_TOKEN||'';
+  if(!base||!token)return;
+  fetch(`${base}/api/internal/worker/exit`,{method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json','user-agent':'Mozilla/5.0 (compatible; OrbitHostWorker/1.0)'},body:JSON.stringify(info),signal:AbortSignal.timeout(10000)})
+    .then((r)=>{if(!r.ok)r.text().then((t)=>console.log(`[OrbitHost worker] Exit report rejected (${r.status}): ${t.slice(0,160)}`)).catch(()=>{})})
+    .catch((e)=>console.log(`[OrbitHost worker] Exit report failed: ${e&&e.message||e}`));
+}
+function requiredEnvScan(dir,provided){
+  const providedKeys=new Set(Object.keys(provided||{}).map((k)=>String(k)));
+  const missing=new Map();let scanned=0,refs=0;
+  const skipRe=/^(\.git|node_modules|__pycache__|venv|\.venv|env|site-packages)(\/|$)/i;
+  let files=[];
+  try{
+    files=fs.readdirSync(dir,{withFileTypes:true}).flatMap((e)=>{
+      if(e.isDirectory()){try{return fs.readdirSync(path.join(dir,e.name),{withFileTypes:true}).filter((c)=>c.isFile()).map((c)=>`${e.name}/${c.name}`)}catch{return[]}}
+      return e.isFile()?[e.name]:[];
+    });
+  }catch{return {missing:[],scanned:0,refs:0}}
+  for(const rel of files){
+    if(skipRe.test(rel))continue;
+    if(!/\.(py|js|mjs|cjs|sh)$/i.test(rel))continue;
+    let text='';
+    try{const st=fs.statSync(path.join(dir,rel));if(st.size>512*1024)continue;text=fs.readFileSync(path.join(dir,rel),'utf8')}catch{continue}
+    scanned++;
+    for(const raw of text.split(/\r?\n/)){
+      const line=raw.trim();
+      if(!line||line.startsWith('#')||line.startsWith('//'))continue;
+      for(const m of line.matchAll(/os\.environ\[["']([A-Za-z_][A-Za-z0-9_]*)["']\]/g)){
+        const name=m[1];refs++;
+        const after=line.slice(line.indexOf(name)+name.length);
+        const optional=/in\s+os\.environ|\belse\b/.test(after);
+        if(!optional&&!providedKeys.has(name)&&!missing.has(name))missing.set(name,rel);
+      }
+      let m;const reGet=/os\.(?:environ\.get|getenv)\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*(,[^)]*)?\)/g;
+      while((m=reGet.exec(line))){
+        if(m[2]!==undefined)continue;
+        const name=m[1];refs++;
+        const after=line.slice(reGet.lastIndex);
+        if(!/\bor\b|\|\||\?\?/.test(after)&&!providedKeys.has(name)&&!missing.has(name))missing.set(name,rel);
+      }
+      const reJs=/(?:process\.env\.([A-Za-z_][A-Za-z0-9_]*)|process\.env\[["']([A-Za-z_][A-Za-z0-9_]*)["']\])/g;
+      while((m=reJs.exec(line))){
+        const name=m[1]||m[2];refs++;
+        const after=line.slice(reJs.lastIndex);
+        if(!/\|\||\?\?/.test(after)&&!providedKeys.has(name)&&!missing.has(name))missing.set(name,rel);
+      }
+      if(missing.size>=12)break;
+    }
+    if(missing.size>=12)break;
+  }
+  return {missing:[...missing.keys()],scanned,refs};
+}
+
+function spawnBot(id,secrets,deploymentId){
   const meta=readMeta(id);
   if(!meta||!meta.startCommand)return Promise.reject(new Error('No start command recorded for this project. Deploy it first.'));
   const dir=projectPath(id);
@@ -408,21 +472,40 @@ function spawnBot(id,secrets){
     loggerMiss.line(`[OrbitHost worker] Process failed to start: ${msg}`);loggerMiss.end();
     return Promise.reject(new Error(msg));
   }
-  const logger=runtimeLogger(id,secrets);
+  let lastFatal=null;
+  const logger=runtimeLogger(id,secrets,(line)=>{const info=fatalLineInfo(line);if(info)lastFatal={line:info,at:Date.now()}});
   const child=spawn('/bin/sh',['-c',meta.startCommand],{cwd:dir,env:childEnv(dir,secrets,id),stdio:['ignore','pipe','pipe'],detached:true});
-  const entry={child,startedAt:Date.now(),logger,lastSample:null};
+  const entry={child,startedAt:Date.now(),logger,lastSample:null,deploymentId:deploymentId||'',stopRequested:false};
   procs.set(id,entry);
   child.stdout.on('data',c=>{try{logger.write(c)}catch{}});
   child.stderr.on('data',c=>{try{logger.write(c)}catch{}});
   child.on('close',(code,signal)=>{
     if(procs.get(id)===entry)procs.delete(id);
+    const uptimeSec=Math.max(0,Math.floor((Date.now()-entry.startedAt)/1000));
     try{logger.line(`[OrbitHost worker] Process exited with ${code===null?`signal ${signal}`:`exit code ${code}`}.`);logger.end()}catch{}
+    if(entry.stopRequested)return;
+    const crashed=code===null?Boolean(signal):code!==0;
+    if(!crashed)return;
+    const fatalLine=lastFatal&&Date.now()-lastFatal.at<=15000?lastFatal.line.slice(0,240):'';
+    try{
+      const meta=readMeta(id);
+      if(meta&&meta.startCommand&&uptimeSec<3000){
+        const n=(Number(meta.consecutiveFastExits)||0)+1;
+        if(n>=3){
+          writeMeta(id,{...meta,autoStart:false,consecutiveFastExits:n});
+          const dis=runtimeLogger(id,getSecrets(id));
+          dis.line('[OrbitHost worker] Auto-start disabled after three consecutive immediate exits. Fix the startup error in the logs, then start the project manually.');dis.end();
+        }else writeMeta(id,{...meta,consecutiveFastExits:n});
+      }else if(meta&&meta.startCommand&&uptimeSec>=60000&&meta.consecutiveFastExits){writeMeta(id,{...meta,consecutiveFastExits:0})}
+    }catch{}
+    reportProcessExit(id,{projectId:id,exitCode:code===null?null:code,signal:signal||'',uptimeSec,deploymentId:entry.deploymentId||'',fatalLine});
   });
   child.on('error',(error)=>{try{logger.line(`[OrbitHost worker] Process failed to start: ${error.message}.`);logger.end()}catch{}});
   return Promise.resolve({status:'online'});
 }
 function stopProcess(id,grace=10000){
   const entry=procs.get(id);if(!entry)return Promise.resolve();
+  entry.stopRequested=true;
   procs.delete(id);
   const child=entry.child;
   return new Promise((resolve)=>{
@@ -460,6 +543,12 @@ async function deployProcess(body,file){
   const pick=resolveStartCommand(dir,startCommand);
   if(pick.changed){log(`[OrbitHost worker] Start file ${pick.missing} was not found in the project; using ${pick.startCommand} instead.\n`);startCommand=pick.startCommand}
   else if(pick.missing){throw new Error(`Start file ${pick.missing} was not found in the project source. Top-level Python files: ${(pick.files||[]).slice(0,12).join(', ')||'none'}. Fix the start command and deploy again.`)}
+  const envScan=requiredEnvScan(dir,env);
+  if(envScan.missing.length){
+    const list=envScan.missing.slice(0,8).join(', ');
+    const more=envScan.missing.length>8?` and ${envScan.missing.length-8} more`:'';
+    throw new Error(`Deployment failed before the build started: this project reads environment variables that are not configured (${list}${more}). Add them under the Environment tab, or give them defaults in the code, then deploy again.`);
+  }else if(envScan.refs){log(`[OrbitHost worker] Environment preflight passed: ${envScan.refs} variable reference(s) checked across ${envScan.scanned} source file(s).\n`)}
   let hostPython='';
   try{hostPython=(await run('python3',['-c','import platform;print(platform.python_version())'],{timeout:20000})).stdout.trim()}catch{}
   log(`\n[OrbitHost worker] Process mode build. Requested Python ${version}; worker runtime Python ${hostPython||'unavailable'}.\n`);
@@ -486,7 +575,7 @@ async function deployProcess(body,file){
   writeMeta(id,{startCommand,buildCommand,pythonVersion:version,autoStart:true,reqHash});
   fs.mkdirSync(path.join(DATA,`botdata-${id}`),{recursive:true,mode:0o700});
   log('\n[OrbitHost worker] Starting process…\n');
-  await spawnBot(id,env);
+  await spawnBot(id,env,String(body.deploymentId||''));
   await new Promise(r=>setTimeout(r,2500));
   if(deletedProjects.has(id))throw new Error('Deployment aborted: the project was deleted while this deployment was running.');
   if(!procs.has(id)){
