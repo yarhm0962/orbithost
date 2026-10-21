@@ -310,7 +310,12 @@ CREATE TABLE IF NOT EXISTS rate_limits (ip TEXT NOT NULL, route TEXT NOT NULL, w
 let schemaPromise = null;
 function ensureSchema(env) {
   if (!schemaPromise) {
-    schemaPromise = env.DB.exec(DDL).catch((error) => { schemaPromise = null; throw error; });
+    schemaPromise = env.DB.exec(DDL).then(async () => {
+      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT']) {
+        try { await env.DB.prepare(statement).run(); } catch (migrationError) { if (!/duplicate column name|already exists/i.test(String(migrationError && migrationError.message || ''))) throw migrationError; }
+      }
+      await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users(username_lower)').run();
+    }).catch((error) => { schemaPromise = null; throw error; });
   }
   return schemaPromise;
 }
@@ -320,7 +325,23 @@ function ensureSchema(env) {
 const first = async (q) => await q.first();
 const rows = async (q) => (await q.all()).results || [];
 
-function publicUser(row) { return { id: row.id, email: row.email, createdAt: row.created_at }; }
+const GMAIL_RE = /^[a-z0-9](?:[a-z0-9._%+-]{0,62}[a-z0-9])?@gmail\.com$/;
+const USERNAME_RE = /^[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*$/;
+function validateGmail(email) {
+  if (!email || !GMAIL_RE.test(email)) return 'Enter a valid Gmail address ending in @gmail.com.';
+  return null;
+}
+function validateUsername(username) {
+  if (!username || username.length < 3 || username.length > 20) return 'Use between 3 and 20 characters for your username.';
+  if (!USERNAME_RE.test(username)) return 'Usernames can only contain letters, numbers, and dots: no spaces, and a dot cannot start, end, or repeat.';
+  return null;
+}
+function validatePassword(password) {
+  if (!password || password.length < 10 || password.length > 128 || new Blob([password]).size > 72) return 'Use a password with at least 10 characters and no more than 72 UTF-8 bytes.';
+  if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) return 'Include at least one letter and one number in your password.';
+  return null;
+}
+function publicUser(row) { return { id: row.id, email: row.email, username: row.username || null, createdAt: row.created_at }; }
 
 async function ownerProject(env, userId, projectId) {
   return first(env.DB.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').bind(projectId, userId));
@@ -509,18 +530,46 @@ async function handle(request, env, method, path, url, ip) {
     return json({ error: 'Not found.' }, 404);
   }
 
+  if (path === '/auth/register/check-email' && method === 'POST') {
+    await authRateLimit(env, ip);
+    checkCsrf();
+    const body = await readJson(request);
+    const email = safeText(body.email, 254).toLowerCase();
+    const gmailError = validateGmail(email);
+    if (gmailError) return json({ error: gmailError }, 400);
+    if (await first(env.DB.prepare('SELECT 1 FROM users WHERE email = ?').bind(email))) return json({ error: 'An account with that Gmail address is already registered.' }, 409);
+    return json({ ok: true });
+  }
+
+  if (path === '/auth/register/check-username' && method === 'POST') {
+    await authRateLimit(env, ip);
+    checkCsrf();
+    const body = await readJson(request);
+    const username = safeText(body.username, 32).trim();
+    const usernameError = validateUsername(username);
+    if (usernameError) return json({ error: usernameError }, 400);
+    if (await first(env.DB.prepare('SELECT 1 FROM users WHERE username_lower = ?').bind(username.toLowerCase()))) return json({ error: 'That username is already taken.' }, 409);
+    return json({ ok: true });
+  }
+
   if (path === '/auth/register' && method === 'POST') {
     await authRateLimit(env, ip);
     checkCsrf();
     const body = await readJson(request);
     const email = safeText(body.email, 254).toLowerCase();
+    const username = safeText(body.username, 32).trim();
     const password = typeof body.password === 'string' ? body.password : '';
-    if (!EMAIL_RE.test(email)) return json({ error: 'Enter a valid email address.' }, 400);
-    if (password.length < 10 || password.length > 128 || new Blob([password]).size > 72) return json({ error: 'Use a password with at least 10 characters and no more than 72 UTF-8 bytes.' }, 400);
-    if (await first(env.DB.prepare('SELECT 1 FROM users WHERE email = ?').bind(email))) return json({ error: 'An account with that email already exists.' }, 409);
-    const user = { id: crypto.randomUUID(), email, created_at: nowISO() };
-    await env.DB.prepare('INSERT INTO users(id,email,password_hash,created_at) VALUES(?,?,?,?)')
-      .bind(user.id, email, await hashPassword(password, env), user.created_at).run();
+    const gmailError = validateGmail(email);
+    if (gmailError) return json({ error: gmailError }, 400);
+    if (await first(env.DB.prepare('SELECT 1 FROM users WHERE email = ?').bind(email))) return json({ error: 'An account with that Gmail address is already registered.' }, 409);
+    const usernameError = validateUsername(username);
+    if (usernameError) return json({ error: usernameError }, 400);
+    if (await first(env.DB.prepare('SELECT 1 FROM users WHERE username_lower = ?').bind(username.toLowerCase()))) return json({ error: 'That username is already taken.' }, 409);
+    const passwordError = validatePassword(password);
+    if (passwordError) return json({ error: passwordError }, 400);
+    const user = { id: crypto.randomUUID(), email, username, created_at: nowISO() };
+    await env.DB.prepare('INSERT INTO users(id,email,username,username_lower,password_hash,created_at) VALUES(?,?,?,?,?,?)')
+      .bind(user.id, email, username, username.toLowerCase(), await hashPassword(password, env), user.created_at).run();
     const sessionData = { u: user.id, c: bytesToB64url(crypto.getRandomValues(new Uint8Array(32))), e: Date.now() + SESSION_TTL_MS };
     return json({ user: publicUser(user), csrfToken: sessionData.c }, 201, { 'set-cookie': await writeSession(env, sessionData) });
   }
@@ -658,8 +707,8 @@ async function handle(request, env, method, path, url, ip) {
       checkCsrf();
       projectOperations.add(p.id);
       try {
-        await workerRequest(env, `/v1/projects/${p.id}/action`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'delete' }) });
-        await addActivity(env, userId, null, 'project_deleted', `${p.name} was deleted.`);
+        const deleteResult = await workerRequest(env, `/v1/projects/${p.id}/action`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'delete' }) });
+        await addActivity(env, userId, null, 'project_deleted', `${p.name} was deleted.${deleteResult && deleteResult.wasRunning ? ' Its running bot process was stopped.' : ''}`);
         await deleteBundle(env, p.source_bundle);
         await env.DB.prepare('DELETE FROM projects WHERE id=?').bind(p.id).run();
         return json({ ok: true });

@@ -433,6 +433,21 @@ function stopProcess(id,grace=10000){
     setTimeout(finish,Math.max(2000,grace+2000)).unref?.();
   });
 }
+async function killProjectStragglers(id){
+  const marker=projectPath(id);let killed=0;let pids=[];
+  try{pids=fs.readdirSync('/proc').filter(n=>/^\d+$/.test(n)).map(Number)}catch{return 0}
+  for(const pid of pids){
+    if(pid===process.pid)continue;
+    try{
+      const cmd=fs.readFileSync(`/proc/${pid}/cmdline`,'utf8');
+      if(!cmd||!cmd.includes(marker))continue;
+      try{process.kill(-pid,'SIGKILL')}catch{try{process.kill(pid,'SIGKILL')}catch{}}
+      killed++;
+    }catch{}
+  }
+  if(killed)console.log(`[OrbitHost worker] Delete cleanup for ${id}: killed ${killed} leftover process(es).`);
+  return killed;
+}
 async function deployProcess(body,file){
   const id=String(body.projectId||'');if(!validId(id))throw new Error('Invalid project ID.');
   const version=String(body.pythonVersion||'3.12');if(!VERSIONS.has(version))throw new Error('Unsupported Python version.');
@@ -488,13 +503,15 @@ async function containerActionProcess(id,action){
   const secrets=getSecrets(id);
   if(action==='delete'){
     deletedProjects.add(id);
+    const wasRunning=procs.has(id);
     await stopProcess(id,6000).catch(()=>{});
     procs.delete(id);
     await fs.promises.rm(projectPath(id),{recursive:true,force:true});
     await fs.promises.rm(venvPath(id),{recursive:true,force:true});
     await fs.promises.rm(path.join(DATA,`botdata-${id}`),{recursive:true,force:true});
     await fs.promises.rm(buildLogPath(id),{force:true});await fs.promises.rm(runtimeArchivePath(id),{force:true});await fs.promises.rm(secretPath(id),{force:true});await fs.promises.rm(metaPath(id),{force:true});
-    return {status:'deleted'};
+    const stragglers=await killProjectStragglers(id);
+    return {status:'deleted',wasRunning,killed:stragglers||0};
   }
   if(!['start','stop','restart'].includes(action))throw new Error('Unsupported action.');
   if(action==='stop'){await stopProcess(id);const meta=readMeta(id);if(meta)writeMeta(id,{...meta,autoStart:false});return {status:'stopped'}}
@@ -737,6 +754,7 @@ app.post('/v1/projects/:id/deploy',upload.single('bundle'),(req,res)=>{req.body=
 app.get('/v1/restore/run',async(req,res)=>{try{await restoreFromControlPlane()}catch(e){console.log(`[OrbitHost worker] Manual restore failed: ${e.message}`)}res.json(restoreState)});
 app.get('/v1/restore/status',(req,res)=>res.json(restoreState));
 app.get('/v1/watchdog/status',(req,res)=>res.json({...watchdogState,activeDeploys:[...activeDeploys]}));
+app.get('/v1/procs',(req,res)=>res.json({processes:[...procs.entries()].map(([id,e])=>({id,pid:e&&e.child?e.child.pid:null}))}));
 app.post('/v1/projects/:id/action',async(req,res)=>{try{const result=await actionImpl(req.params.id,req.body?.action);if(req.body?.action==='start')restartBackoff.delete(req.params.id);res.json(result)}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/status',async(req,res)=>{try{res.json(await statusImpl(req.params.id))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
 app.get('/v1/projects/:id/logs',async(req,res)=>{try{const stream=req.query.stream==='build'?'build':'runtime';res.json(await logsImpl(req.params.id,stream))}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
