@@ -89,7 +89,7 @@ async function api(url, options = {}) {
   if (options.body && !(options.body instanceof FormData) && typeof options.body !== 'string') { headers['content-type']='application/json'; options={...options,body:JSON.stringify(options.body)}; }
   const response=await fetch(url,{credentials:'same-origin',...options,method,headers});
   const data=await response.json().catch(()=>({}));
-  if (!response.ok) throw new Error(data.error||`Request failed (${response.status}).`);
+  if (!response.ok) { const err=new Error(data.error||`Request failed (${response.status}).`); err.data=data; err.status=response.status; throw err; }
   if(data.csrfToken) state.csrf=data.csrfToken;
   return data;
 }
@@ -304,7 +304,7 @@ function renderRegisterWizard() {
 }
 function renderAuth() {
   const registering=state.authMode==='register';
-  return `<div class="auth-screen"><section class="auth-showcase"><div class="auth-brand"><div class="brand-mark"><svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="13"/><ellipse cx="20" cy="20" rx="18" ry="7" transform="rotate(-35 20 20)"/><circle class="mark-dot" cx="31" cy="10" r="2.5"/></svg></div><div><div class="brand-name">OrbitHost</div><div class="brand-tagline">Bot infrastructure</div></div></div><div class="auth-copy"><div class="eyebrow">A home for your Discord bots</div><h1>Less server babysitting.<br><span>More building.</span></h1><p>Keep your bot projects, secrets, deployment history, and runtime logs in one calm, focused workspace.</p><div class="auth-feature-list"><div class="auth-feature"><span class="feature-icon">${icon('rocket')}</span>Deploy from a ZIP or Git repository</div><div class="auth-feature"><span class="feature-icon">${icon('lock')}</span>Encrypted environment variables</div><div class="auth-feature"><span class="feature-icon">${icon('terminal')}</span>Searchable logs and deployment history</div></div></div><div class="auth-foot">OrbitHost · Built for developers who ship bots.</div></section><section class="auth-form-side"><div class="auth-form-wrap"><div class="auth-mobile-brand"><div class="brand-mark"><svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="13"/><ellipse cx="20" cy="20" rx="18" ry="7" transform="rotate(-35 20 20)"/><circle class="mark-dot" cx="31" cy="10" r="2.5"/></svg></div><div><div class="brand-name">OrbitHost</div><div class="brand-tagline">Bot infrastructure</div></div></div><div class="auth-form-heading"><div class="eyebrow">Your workspace awaits</div><h2>${registering?'Create your account':'Welcome back'}</h2><p>${registering?'Start organizing and deploying your Discord bot projects.':'Sign in to continue to your bot workspace.'}</p></div><div id="auth-alert" class="auth-alert" role="alert"></div>${registering?renderRegisterWizard():`<form class="auth-form" data-form="auth"><div class="field"><label class="field-label" for="auth-email">Email address</label><input class="field-input" id="auth-email" name="email" type="email" autocomplete="email" placeholder="you@example.com" maxlength="254" required></div><div class="field"><label class="field-label" for="auth-password">Password</label><input class="field-input" id="auth-password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" maxlength="128" required></div><button class="button button-primary auth-submit" type="submit">Sign in ${icon('chevronRight')}</button></form>`}<div class="auth-switch">${registering?'Already have an account?':'New to OrbitHost?'} <button type="button" data-auth-mode="${registering?'login':'register'}">${registering?'Sign in':'Create an account'}</button></div><div class="auth-footnote">By continuing, you agree to use this platform responsibly. Real bot uptime depends on your configured hosting infrastructure.</div></div></section></div>`;
+  return `<div class="auth-screen"><section class="auth-showcase"><div class="auth-brand"><div class="brand-mark"><svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="13"/><ellipse cx="20" cy="20" rx="18" ry="7" transform="rotate(-35 20 20)"/><circle class="mark-dot" cx="31" cy="10" r="2.5"/></svg></div><div><div class="brand-name">OrbitHost</div><div class="brand-tagline">Bot infrastructure</div></div></div><div class="auth-copy"><div class="eyebrow">A home for your Discord bots</div><h1>Less server babysitting.<br><span>More building.</span></h1><p>Keep your bot projects, secrets, deployment history, and runtime logs in one calm, focused workspace.</p><div class="auth-feature-list"><div class="auth-feature"><span class="feature-icon">${icon('rocket')}</span>Deploy from a ZIP or Git repository</div><div class="auth-feature"><span class="feature-icon">${icon('lock')}</span>Encrypted environment variables</div><div class="auth-feature"><span class="feature-icon">${icon('terminal')}</span>Searchable logs and deployment history</div></div></div><div class="auth-foot">OrbitHost · Built for developers who ship bots.</div></section><section class="auth-form-side"><div class="auth-form-wrap"><div class="auth-mobile-brand"><div class="brand-mark"><svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="13"/><ellipse cx="20" cy="20" rx="18" ry="7" transform="rotate(-35 20 20)"/><circle class="mark-dot" cx="31" cy="10" r="2.5"/></svg></div><div><div class="brand-name">OrbitHost</div><div class="brand-tagline">Bot infrastructure</div></div></div><div class="auth-form-heading"><div class="eyebrow">Your workspace awaits</div><h2>${registering?'Create your account':'Welcome back'}</h2><p>${registering?'Start organizing and deploying your Discord bot projects.':'Sign in to continue to your bot workspace.'}</p></div><div id="auth-alert" class="auth-alert" role="alert"></div>${registering?renderRegisterWizard():`<form class="auth-form" data-form="auth"><div class="field"><label class="field-label" for="auth-email">Email address</label><input class="field-input" id="auth-email" name="email" type="email" autocomplete="email" placeholder="you@example.com" maxlength="254" required></div><div class="field"><label class="field-label" for="auth-password">Password</label><input class="field-input" id="auth-password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" maxlength="128" required></div><button class="button button-primary auth-submit" type="submit">Sign in ${icon('chevronRight')}</button></form>`}<div class="auth-switch">${registering?'Already have an account?':'New to OrbitHost?'} <button type="button" data-auth-mode="${registering?'login':'register'}">${registering?'Sign in':'Create an account'}</button></div><div class="auth-footnote">By continuing, you agree to use this platform responsibly. Real bot uptime depends on your configured hosting infrastructure.</div></div></section>${state.verify?renderVerifyOverlay():''}</div>`;
 }
 function renderModal() {
   const m=state.modal;if(!m)return '';
@@ -322,6 +322,38 @@ function renderModal() {
     return `<div class="modal-backdrop" data-dismiss="modal"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-header"><div><div class="modal-title" id="modal-title">Quick setup guide</div><div class="modal-subtitle">Configure real containers and stream process output.</div></div><button class="icon-button" data-action="close-modal" aria-label="Close dialog">${icon('x')}</button></div><div class="modal-body"><div style="display:grid;gap:16px">${[['1','Create your project','Upload a ZIP or connect a public HTTPS Git URL. Include your bot entry file and requirements.txt.'],['2','Configure your runtime','Choose Python 3.10–3.13, set your start command, and add secrets such as DISCORD_TOKEN under Environment.'],['3','Deploy the source','Deploy runs the real build, installs requirements.txt, and starts your process in its container.'],['4','Inspect live logs','Runtime logs come directly from the container stdout/stderr stream, including bot.py output.'],['5','Monitor the workload','Inspect measured resources, deployment history, worker health, and host storage. Uptime depends on your plan and infrastructure.']].map(([n,t,c])=>`<div style="display:flex;gap:12px"><div class="activity-icon" style="width:30px;height:30px;font-size:11px;font-weight:750">${n}</div><div><div style="font-size:12px;font-weight:700">${t}</div><div style="font-size:10px;color:#8f9bb5;line-height:1.7;margin-top:5px">${c}</div></div></div>`).join('')}</div><div class="modal-footer"><button class="button button-primary" data-action="close-modal">Got it</button></div></div></section></div>`;
   }
   return '';
+}
+function renderVerifyOverlay(){
+  const v=state.verify;if(!v)return '';
+  return `<div class="verify-backdrop" data-dismiss="verify" role="presentation"><section class="verify-card" role="dialog" aria-modal="true" aria-labelledby="verify-title">
+  <button class="icon-button verify-close" data-action="verify-close" aria-label="Close dialog">${icon('x')}</button>
+  <div class="verify-kicker">Almost there</div>
+  <div class="verify-title" id="verify-title">Check your email</div>
+  <p class="verify-sub">We sent a 6-digit code to <strong>${esc(v.email)}</strong>. Enter it below to finish${v.from==='login'?' signing in':' creating your account'}.</p>
+  <form id="verify-form" data-form="verify">
+    <input id="verify-code" class="verify-input" name="code" data-verify-input inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7" value="${esc(v.code||'')}" ${v.busy?'disabled':''}>
+    <div class="verify-actions">
+      <button type="submit" class="button button-primary" ${v.busy?'disabled':''}>${v.busy?'Verifying\u2026':'Verify email'}</button>
+      <button type="button" class="button button-quiet" data-action="verify-resend" ${Date.now()<(v.resendAt||0)?'disabled':''}>Resend code</button>
+    </div>
+  </form>
+  ${v.error?`<div class="verify-error" role="alert">${esc(v.error)}</div>`:''}
+  ${v.ok?`<div class="verify-ok">${esc(v.ok)}</div>`:''}
+  <button type="button" class="verify-link" data-action="verify-back">Wrong address? Go back</button>
+  <div class="verify-note">The code expires in 10 minutes. Can't find it? Check your spam folder.</div>
+  </section></div>`;
+}
+let verifyTicker=null;
+function startVerifyTicker(){
+  if(verifyTicker)clearInterval(verifyTicker);
+  verifyTicker=setInterval(()=>{
+    const btn=document.querySelector('[data-action="verify-resend"]');
+    if(!btn){clearInterval(verifyTicker);verifyTicker=null;return;}
+    if(!state.verify)return;
+    const left=Math.max(0,Math.ceil(((state.verify.resendAt||0)-Date.now())/1000));
+    if(btn.disabled!==(left>0))btn.disabled=left>0;
+    btn.textContent=left>0?`Resend code in ${left}s`:'Resend code';
+  },1000);
 }
 function render() {
   const app=$('#app');if(!app)return;
@@ -462,6 +494,16 @@ async function loadProjectAfterAction(message) {
 async function handleClick(e) {
   const target=e.target.closest('button,[data-open-project],[data-edit-env],[data-delete-env],[data-project-tab],[data-dismiss],[data-resource],[data-auth-mode]');if(!target)return;
   if(target.matches('[data-dismiss="modal"]') && target===e.target){closeModal();return;}
+  if(target.dataset.action==='verify-close'){if(state.verify){state.verify=null;render();}return;}
+  if(target.dataset.action==='verify-back'){const backEmail=state.verify?state.verify.email:'';const fromLogin=state.verify?state.verify.from==='login':false;state.verify=null;if(fromLogin){state.authMode='login';}else{state.authMode='register';state.registerStep=1;state.registerData=backEmail?{email:backEmail}:{};}render();return;}
+  if(target.dataset.action==='verify-resend'){
+    if(!state.verify||state.verify.busy||Date.now()<(state.verify.resendAt||0))return;
+    state.verify.busy=true;state.verify.error='';state.verify.ok='';render();
+    try{await api('/api/auth/verify/resend',{method:'POST',body:{email:state.verify.email}});if(state.verify){state.verify.busy=false;state.verify.ok='New code sent. Check your inbox.';state.verify.code='';state.verify.resendAt=Date.now()+60000;render();startVerifyTicker();}}
+    catch(err){if(state.verify){state.verify.busy=false;state.verify.error=err.message||'Could not resend the code.';render();}}
+    return;
+  }
+  if(target.dataset.dismiss==='verify'&&!e.target.closest('.verify-card')){if(state.verify){state.verify=null;render();}return;}
   if(target.dataset.action==='register-back'){state.registerStep=Math.max(1,(state.registerStep||1)-1);render();return;}
   if(target.dataset.authMode){state.authMode=target.dataset.authMode;state.registerStep=1;state.registerData={};render();return;}
   if(target.dataset.nav){navigate(target.dataset.nav);return;}
@@ -542,8 +584,17 @@ document.addEventListener('input',e=>{
 });
 document.addEventListener('submit',async e=>{
   const form=e.target.closest('form[data-form]');if(!form)return;e.preventDefault();
-  const type=form.dataset.form;const submit=form.querySelector('button[type="submit"]');setButtonBusy(submit,type==='auth'?'Signing in…':type==='create-project'?'Creating project…':type==='save-env'?'Saving secret…':'Saving…');
+  const type=form.dataset.form;const submit=form.querySelector('button[type="submit"]');setButtonBusy(submit,type==='verify'?'Verifying…':type==='auth'?'Signing in…':type==='create-project'?'Creating project…':type==='save-env'?'Saving secret…':'Saving…');
   try {
+    if(type==='verify') {
+      if(!state.verify)return;
+      const code=String(new FormData(form).get('code')||'').replace(/\D/g,'');
+      if(code.length!==6){state.verify.busy=false;state.verify.error='Enter the 6-digit code from your email.';render();return;}
+      state.verify.busy=true;state.verify.error='';state.verify.ok='';render();
+      try{const result=await api('/api/auth/verify',{method:'POST',body:{email:state.verify.email,code}});state.user=result.user;state.csrf=result.csrfToken;state.verify=null;state.activePage='overview';state.activeProject=null;await refreshDashboard();render();showToast('Email verified. Welcome to OrbitHost.');}
+      catch(err){if(state.verify){state.verify.busy=false;state.verify.error=err.message||'Verification failed.';render();}}
+      return;
+    }
     if(type==='auth') {
       const data=Object.fromEntries(new FormData(form).entries());
       if(state.authMode==='register') {
@@ -559,10 +610,13 @@ document.addEventListener('submit',async e=>{
           state.registerStep=3;render();return;
         }
         const result=await api('/api/auth/register',{method:'POST',body:{email:state.registerData.email,username:state.registerData.username,password:data.password}});
+        if(result.needsVerification){state.verify={email:result.email||state.registerData.email,from:'register',busy:false,error:'',ok:'',code:'',resendAt:Date.now()+60000};state.registerStep=1;state.registerData={};render();startVerifyTicker();return;}
         state.user=result.user;state.csrf=result.csrfToken;state.activePage='overview';state.activeProject=null;state.registerStep=1;state.registerData={};
         await refreshDashboard();render();showToast('Your workspace is ready.');return;
       }
-      const result=await api('/api/auth/login',{method:'POST',body:data});
+      let result;
+      try{result=await api('/api/auth/login',{method:'POST',body:data});}
+      catch(err){if(err&&err.data&&err.data.needsVerification){state.verify={email:err.data.email||String(data.email||'').toLowerCase(),from:'login',busy:false,error:'',ok:'',code:'',resendAt:0};render();startVerifyTicker();return;}throw err;}
       state.user=result.user;state.csrf=result.csrfToken;state.activePage='overview';state.activeProject=null;
       await refreshDashboard();render();showToast('Welcome back.');
     } else if(type==='create-project') {
@@ -604,3 +658,10 @@ document.addEventListener('keydown',async e=>{
   if(e.key==='/'&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)&&state.user){e.preventDefault();$('#global-search')?.focus();}
 });
 bootstrap();
+document.addEventListener('input',e=>{
+  const el=e.target.closest?e.target.closest('[data-verify-input]'):null;if(!el)return;
+  const digits=el.value.replace(/\D/g,'').slice(0,6);
+  if(el.value!==digits)el.value=digits;
+  if(state.verify)state.verify.code=digits;
+  if(digits.length===6&&state.verify&&!state.verify.busy){const f=document.getElementById('verify-form');if(f)f.requestSubmit();}
+});

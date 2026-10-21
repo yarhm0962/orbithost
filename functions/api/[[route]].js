@@ -354,13 +354,14 @@ CREATE TABLE IF NOT EXISTS activities (id INTEGER PRIMARY KEY AUTOINCREMENT, use
 CREATE INDEX IF NOT EXISTS activity_by_user ON activities(user_id, id DESC);
 CREATE TABLE IF NOT EXISTS bundles (bundle_id TEXT NOT NULL, seq INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(bundle_id, seq));
 CREATE TABLE IF NOT EXISTS rate_limits (ip TEXT NOT NULL, route TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(ip, route));
+CREATE TABLE IF NOT EXISTS email_verifications (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_sent_at INTEGER NOT NULL);
 `;
 
 let schemaPromise = null;
 function ensureSchema(env) {
   if (!schemaPromise) {
     schemaPromise = env.DB.exec(DDL).then(async () => {
-      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT']) {
+      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT', 'ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0']) {
         try { await env.DB.prepare(statement).run(); } catch (migrationError) { if (!/duplicate column name|already exists/i.test(String(migrationError && migrationError.message || ''))) throw migrationError; }
       }
       await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users(username_lower)').run();
@@ -396,6 +397,43 @@ function validatePassword(password) {
   if (!password || password.length < 10 || password.length > 128 || new Blob([password]).size > 72) return 'Use a password with at least 10 characters and no more than 72 UTF-8 bytes.';
   if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) return 'Include at least one letter and one number in your password.';
   return null;
+}
+// --- email verification (real 6-digit codes, hashed at rest; delivery over HTTPS because Render blocks SMTP) ---
+
+const CODE_TTL_MS = 10 * 60 * 1000;
+const CODE_RESEND_MS = 60 * 1000;
+const CODE_MAX_ATTEMPTS = 5;
+async function hashCodeValue(code, email, env) {
+  const pepper = String(env.SESSION_SECRET || 'orbithost');
+  const digest = await crypto.subtle.digest('SHA-256', enc.encode(`${pepper}|${email.toLowerCase()}|${code}`));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+const escapeHtmlEmail = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+async function sendVerificationEmail(env, to, code, username) {
+  if (!env.BREVO_API_KEY || !env.SENDER_EMAIL) return { ok: false, error: 'Email delivery is not configured yet.' };
+  const name = escapeHtmlEmail(username || 'there');
+  const html = `<div style="font-family:Arial,Helvetica,sans-serif;background:#f4f5f7;padding:30px 12px"><div style="max-width:460px;margin:0 auto;background:#ffffff;border:1px solid #e2e5ea;border-radius:12px;padding:30px"><div style="font-size:12px;letter-spacing:2px;color:#8a8f98;font-weight:bold">ORBITHOST</div><h1 style="font-size:20px;color:#1a1d23;margin:14px 0 8px">Verify your email</h1><p style="font-size:14px;color:#3c4048;line-height:1.6;margin:0 0 18px">Hi ${name}, use this 6-digit code to finish creating your OrbitHost account. It expires in 10 minutes.</p><div style="font-size:32px;font-weight:bold;letter-spacing:10px;color:#1a1d23;background:#f2f3f5;border:1px solid #e2e5ea;border-radius:10px;padding:16px 0;text-align:center">${code}</div><p style="font-size:12px;color:#8a8f98;line-height:1.6;margin:18px 0 0">If you didn't create an OrbitHost account, you can ignore this email and the address will not be registered.</p></div></div>`;
+  const text = `Your OrbitHost verification code is ${code}. It expires in 10 minutes. If you didn't create an account, ignore this email.`;
+  let res;
+  try {
+    res = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': env.BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ sender: { email: env.SENDER_EMAIL, name: env.SENDER_NAME || 'OrbitHost' }, to: [{ email: to }], subject: `Your OrbitHost verification code: ${code}`, htmlContent: html, textContent: text })
+    });
+  } catch (sendError) {
+    return { ok: false, error: 'Could not reach the email service. Please try again.' };
+  }
+  if (!res.ok) return { ok: false, error: `The email service rejected the request (${res.status}). Please try again shortly.` };
+  return { ok: true };
+}
+async function issueVerificationCode(env, email, username) {
+  const code = String(crypto.getRandomValues(new Uint32Array(1))[0] % 1000000).padStart(6, '0');
+  const now = Date.now();
+  await env.DB.prepare('INSERT INTO email_verifications(email,code_hash,expires_at,attempts,last_sent_at) VALUES(?,?,?,?,?) ON CONFLICT(email) DO UPDATE SET code_hash=excluded.code_hash, expires_at=excluded.expires_at, attempts=0, last_sent_at=excluded.last_sent_at')
+    .bind(email, await hashCodeValue(code, email, env), now + CODE_TTL_MS, 0, now).run();
+  const sent = await sendVerificationEmail(env, email, code, username);
+  return { sent: sent.ok, error: sent.error };
 }
 function publicUser(row) { return { id: row.id, email: row.email, username: row.username || null, createdAt: row.created_at }; }
 
@@ -712,7 +750,8 @@ async function handle(request, env, method, path, url, ip) {
     const email = safeText(body.email, 254).toLowerCase();
     const gmailError = validateGmail(email);
     if (gmailError) return json({ error: gmailError }, 400);
-    if (await first(env.DB.prepare('SELECT 1 FROM users WHERE email = ?').bind(email))) return json({ error: 'An account with that Gmail address is already registered.' }, 409);
+    const dup = await first(env.DB.prepare('SELECT email_verified FROM users WHERE email = ?').bind(email));
+    if (dup) return json({ error: dup.email_verified ? 'An account with that Gmail address is already registered.' : 'An account with that Gmail address is already registered. Sign in to finish verifying it.' }, 409);
     const gmailCanon = gmailCanonicalLocal(email);
     if (gmailCanon && gmailCanon !== email.slice(0, email.indexOf('@')) && await first(env.DB.prepare("SELECT 1 FROM users WHERE email LIKE '%@gmail.com' AND LOWER(REPLACE(SUBSTR(email,1,INSTR(email,'@')-1),'.','')) = ?").bind(gmailCanon))) return json({ error: 'An account with that Gmail address is already registered.' }, 409);
     return json({ ok: true });
@@ -738,7 +777,8 @@ async function handle(request, env, method, path, url, ip) {
     const password = typeof body.password === 'string' ? body.password : '';
     const gmailError = validateGmail(email);
     if (gmailError) return json({ error: gmailError }, 400);
-    if (await first(env.DB.prepare('SELECT 1 FROM users WHERE email = ?').bind(email))) return json({ error: 'An account with that Gmail address is already registered.' }, 409);
+    const dup = await first(env.DB.prepare('SELECT email_verified FROM users WHERE email = ?').bind(email));
+    if (dup) return json({ error: dup.email_verified ? 'An account with that Gmail address is already registered.' : 'An account with that Gmail address is already registered. Sign in to finish verifying it.' }, 409);
     const gmailCanon = gmailCanonicalLocal(email);
     if (gmailCanon && gmailCanon !== email.slice(0, email.indexOf('@')) && await first(env.DB.prepare("SELECT 1 FROM users WHERE email LIKE '%@gmail.com' AND LOWER(REPLACE(SUBSTR(email,1,INSTR(email,'@')-1),'.','')) = ?").bind(gmailCanon))) return json({ error: 'An account with that Gmail address is already registered.' }, 409);
     const usernameError = validateUsername(username);
@@ -747,10 +787,70 @@ async function handle(request, env, method, path, url, ip) {
     const passwordError = validatePassword(password);
     if (passwordError) return json({ error: passwordError }, 400);
     const user = { id: crypto.randomUUID(), email, username, created_at: nowISO() };
-    await env.DB.prepare('INSERT INTO users(id,email,username,username_lower,password_hash,created_at) VALUES(?,?,?,?,?,?)')
+    await env.DB.prepare('INSERT INTO users(id,email,username,username_lower,password_hash,email_verified,created_at) VALUES(?,?,?,?,?,0,?)')
       .bind(user.id, email, username, username.toLowerCase(), await hashPassword(password, env), user.created_at).run();
+    const mailed = await issueVerificationCode(env, user.email, username);
+    if (!mailed.sent) {
+      await env.DB.prepare('DELETE FROM email_verifications WHERE email = ?').bind(user.email).run();
+      await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(user.id).run();
+      return json({ error: mailed.error || 'We could not send the verification email. Please try again.' }, 502);
+    }
+    return json({ needsVerification: true, email: user.email }, 201);
+  }
+
+  if (path === '/auth/verify' && method === 'POST') {
+    await authRateLimit(env, ip);
+    checkCsrf();
+    const body = await readJson(request);
+    const email = safeText(body.email, 254).toLowerCase();
+    const code = String(body.code || '').replace(/\D/g, '');
+    if (!GMAIL_RE.test(email)) return json({ error: 'Enter a valid Gmail address.' }, 400);
+    if (code.length !== 6) return json({ error: 'Enter the 6-digit code from your email.' }, 400);
+    let user = await first(env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email));
+    if (!user) {
+      const gmailCanon = gmailCanonicalLocal(email);
+      if (gmailCanon) user = await first(env.DB.prepare("SELECT * FROM users WHERE email LIKE '%@gmail.com' AND LOWER(REPLACE(SUBSTR(email,1,INSTR(email,'@')-1),'.','')) = ?").bind(gmailCanon));
+    }
+    if (!user) return json({ error: 'No account is waiting for verification at that address.' }, 404);
+    if (user.email_verified) return json({ error: 'That account is already verified. Sign in instead.' }, 400);
+    const row = await first(env.DB.prepare('SELECT * FROM email_verifications WHERE email = ?').bind(user.email));
+    const now = Date.now();
+    if (!row) return json({ error: 'No active code for that address. Request a new one below.' }, 400);
+    if (row.expires_at < now) return json({ error: 'That code has expired. Request a new one below.' }, 410);
+    if (row.attempts >= CODE_MAX_ATTEMPTS) {
+      await env.DB.prepare('DELETE FROM email_verifications WHERE email = ?').bind(user.email).run();
+      return json({ error: 'Too many wrong attempts. Request a new code.' }, 429);
+    }
+    if ((await hashCodeValue(code, user.email, env)) !== row.code_hash) {
+      const attempts = (row.attempts || 0) + 1;
+      if (attempts >= CODE_MAX_ATTEMPTS) await env.DB.prepare('DELETE FROM email_verifications WHERE email = ?').bind(user.email).run();
+      else await env.DB.prepare('UPDATE email_verifications SET attempts = ? WHERE email = ?').bind(attempts, user.email).run();
+      return json({ error: attempts >= CODE_MAX_ATTEMPTS ? 'Too many wrong attempts. Request a new code.' : "That code isn't right. Check the latest email and try again." }, 400);
+    }
+    await env.DB.prepare('UPDATE users SET email_verified = 1 WHERE id = ?').bind(user.id).run();
+    await env.DB.prepare('DELETE FROM email_verifications WHERE email = ?').bind(user.email).run();
     const sessionData = { u: user.id, c: bytesToB64url(crypto.getRandomValues(new Uint8Array(32))), e: Date.now() + SESSION_TTL_MS };
-    return json({ user: publicUser(user), csrfToken: sessionData.c }, 201, { 'set-cookie': await writeSession(env, sessionData) });
+    return json({ user: publicUser(user), csrfToken: sessionData.c }, 200, { 'set-cookie': await writeSession(env, sessionData) });
+  }
+
+  if (path === '/auth/verify/resend' && method === 'POST') {
+    await authRateLimit(env, ip);
+    checkCsrf();
+    const body = await readJson(request);
+    const email = safeText(body.email, 254).toLowerCase();
+    if (!GMAIL_RE.test(email)) return json({ error: 'Enter a valid Gmail address.' }, 400);
+    let user = await first(env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email));
+    if (!user) {
+      const gmailCanon = gmailCanonicalLocal(email);
+      if (gmailCanon) user = await first(env.DB.prepare("SELECT * FROM users WHERE email LIKE '%@gmail.com' AND LOWER(REPLACE(SUBSTR(email,1,INSTR(email,'@')-1),'.','')) = ?").bind(gmailCanon));
+    }
+    if (!user) return json({ error: 'No account is waiting for verification at that address.' }, 404);
+    if (user.email_verified) return json({ error: 'That account is already verified. Sign in instead.' }, 400);
+    const row = await first(env.DB.prepare('SELECT last_sent_at FROM email_verifications WHERE email = ?').bind(user.email));
+    if (row && Date.now() - row.last_sent_at < CODE_RESEND_MS) return json({ error: 'A code was just sent. Please wait a minute before asking for another.' }, 429);
+    const mailed = await issueVerificationCode(env, user.email, user.username);
+    if (!mailed.sent) return json({ error: mailed.error || 'We could not send the verification email. Please try again.' }, 502);
+    return json({ ok: true });
   }
 
   if (path === '/auth/login' && method === 'POST') {
@@ -767,6 +867,7 @@ async function handle(request, env, method, path, url, ip) {
     if (new Blob([password]).size > 72 || !user || !(await verifyPassword(password, user.password_hash))) {
       return json({ error: 'Email or password is incorrect.' }, 401);
     }
+    if (!user.email_verified) return json({ needsVerification: true, email: user.email }, 403);
     const sessionData = { u: user.id, c: bytesToB64url(crypto.getRandomValues(new Uint8Array(32))), e: Date.now() + SESSION_TTL_MS };
     return json({ user: publicUser(user), csrfToken: sessionData.c }, 200, { 'set-cookie': await writeSession(env, sessionData) });
   }
