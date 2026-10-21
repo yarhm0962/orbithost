@@ -378,7 +378,14 @@ const GMAIL_RE = /^[a-z0-9](?:[a-z0-9._%+-]{0,62}[a-z0-9])?@gmail\.com$/;
 const USERNAME_RE = /^[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*$/;
 function validateGmail(email) {
   if (!email || !GMAIL_RE.test(email)) return 'Enter a valid Gmail address ending in @gmail.com.';
+  const local = email.slice(0, email.indexOf('@'));
+  if (local.includes('+')) return 'Gmail aliases with a plus sign are not allowed. Use your plain Gmail address, like name@gmail.com.';
   return null;
+}
+function gmailCanonicalLocal(email) {
+  const at = email.indexOf('@');
+  if (at < 0 || !/@gmail\.com$/.test(email)) return null;
+  return email.slice(0, at).replace(/\./g, '');
 }
 function validateUsername(username) {
   if (!username || username.length < 3 || username.length > 20) return 'Use between 3 and 20 characters for your username.';
@@ -603,6 +610,35 @@ async function handle(request, env, method, path, url, ip) {
 
   // ---- worker-only internal endpoints (Bearer WORKER_TOKEN) ----
 
+  if (path === '/internal/worker/running' && method === 'POST') {
+    const auth = request.headers.get('authorization') || '';
+    if (!env.WORKER_TOKEN || auth !== `Bearer ${env.WORKER_TOKEN}`) return json({ error: 'Unauthorized.' }, 401);
+    const body = await readJson(request);
+    const projectId = String(body.projectId || '');
+    if (!/^[a-f0-9-]{36}$/i.test(projectId)) return json({ error: 'Invalid project ID.' }, 400);
+    const p = await first(env.DB.prepare('SELECT id,status FROM projects WHERE id=?').bind(projectId));
+    if (!p) return json({ ok: true, note: 'Project no longer exists.' });
+    if (p.status === 'deploying') return json({ ok: true, note: 'Deploying.' });
+    await env.DB.prepare("UPDATE projects SET status='online',updated_at=? WHERE id=?").bind(nowISO(), projectId).run();
+    return json({ ok: true });
+  }
+
+  if (path === '/internal/worker/db' && method === 'POST') {
+    const auth = request.headers.get('authorization') || '';
+    if (!env.WORKER_TOKEN || auth !== `Bearer ${env.WORKER_TOKEN}`) return json({ error: 'Unauthorized.' }, 401);
+    const body = await readJson(request);
+    const sql = String(body.sql || '');
+    if (!sql || sql.length > 8000 || /;\s*(attach|pragma)/i.test(sql)) return json({ error: 'Unsupported SQL.' }, 400);
+    const params = Array.isArray(body.params) ? body.params : [];
+    try {
+      const bound = env.DB.prepare(sql).bind(...params);
+      const result = /^\s*select/i.test(sql) ? await bound.all() : await bound.run();
+      return json({ ok: true, rows: result.results === undefined ? [] : result.results });
+    } catch (e) {
+      return json({ error: safeText(String((e && e.message) || e), 300) }, 400);
+    }
+  }
+
   if (path === '/internal/worker/deploy-complete' && method === 'POST') {
     const auth = request.headers.get('authorization') || '';
     if (!env.WORKER_TOKEN || auth !== `Bearer ${env.WORKER_TOKEN}`) return json({ error: 'Unauthorized.' }, 401);
@@ -677,6 +713,8 @@ async function handle(request, env, method, path, url, ip) {
     const gmailError = validateGmail(email);
     if (gmailError) return json({ error: gmailError }, 400);
     if (await first(env.DB.prepare('SELECT 1 FROM users WHERE email = ?').bind(email))) return json({ error: 'An account with that Gmail address is already registered.' }, 409);
+    const gmailCanon = gmailCanonicalLocal(email);
+    if (gmailCanon && gmailCanon !== email.slice(0, email.indexOf('@')) && await first(env.DB.prepare("SELECT 1 FROM users WHERE email LIKE '%@gmail.com' AND LOWER(REPLACE(SUBSTR(email,1,INSTR(email,'@')-1),'.','')) = ?").bind(gmailCanon))) return json({ error: 'An account with that Gmail address is already registered.' }, 409);
     return json({ ok: true });
   }
 
@@ -719,7 +757,11 @@ async function handle(request, env, method, path, url, ip) {
     const body = await readJson(request);
     const email = safeText(body.email, 254).toLowerCase();
     const password = typeof body.password === 'string' ? body.password : '';
-    const user = await first(env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email));
+    let user = await first(env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email));
+    if (!user) {
+      const gmailCanon = gmailCanonicalLocal(email);
+      if (gmailCanon) user = await first(env.DB.prepare("SELECT * FROM users WHERE email LIKE '%@gmail.com' AND LOWER(REPLACE(SUBSTR(email,1,INSTR(email,'@')-1),'.','')) = ?").bind(gmailCanon));
+    }
     if (new Blob([password]).size > 72 || !user || !(await verifyPassword(password, user.password_hash))) {
       return json({ error: 'Email or password is incorrect.' }, 401);
     }

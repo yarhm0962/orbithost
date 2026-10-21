@@ -408,6 +408,12 @@ function reportProcessExit(id,info){
     .then((r)=>{if(!r.ok)r.text().then((t)=>console.log(`[OrbitHost worker] Exit report rejected (${r.status}): ${t.slice(0,160)}`)).catch(()=>{})})
     .catch((e)=>console.log(`[OrbitHost worker] Exit report failed: ${e&&e.message||e}`));
 }
+function reportRunning(id){
+  const base=String(process.env.CONTROL_PLANE_URL||'').replace(/\/$/,'');
+  const token=process.env.WORKER_TOKEN||'';
+  if(!base||!token)return;
+  fetch(`${base}/api/internal/worker/running`,{method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json','user-agent':'Mozilla/5.0 (compatible; OrbitHostWorker/1.0)'},body:JSON.stringify({projectId:id}),signal:AbortSignal.timeout(10000)}).catch(()=>{});
+}
 function requiredEnvScan(dir,provided){
   const providedKeys=new Set(Object.keys(provided||{}).map((k)=>String(k)));
   const missing=new Map();let scanned=0,refs=0;
@@ -478,6 +484,7 @@ function spawnBot(id,secrets,deploymentId){
   const child=spawn('/bin/sh',['-c',meta.startCommand],{cwd:dir,env:childEnv(dir,secrets,id),stdio:['ignore','pipe','pipe'],detached:true});
   const entry={child,startedAt:Date.now(),logger,lastSample:null,deploymentId:deploymentId||'',stopRequested:false};
   procs.set(id,entry);
+  reportRunning(id);
   child.stdout.on('data',c=>{try{logger.write(c)}catch{}});
   child.stderr.on('data',c=>{try{logger.write(c)}catch{}});
   child.on('close',(code,signal)=>{
@@ -696,12 +703,25 @@ function groupRssMb(id){
   return total;
 }
 function resolveMainPid(pid){
+  const isShell=(p)=>{try{const a=fs.readFileSync(`/proc/${p}/cmdline`,'utf8').split('\0').filter(Boolean);const a0=String(a[0]||'').split('/').pop()||'';return /^(ba|da|z)?sh$/.test(a0)}catch{return true}};
+  try{if(!isShell(pid))return pid}catch{}
   try{
-    if(/python/.test(fs.readFileSync(`/proc/${pid}/cmdline`,'utf8')))return pid;
-    const dir=`/proc/${pid}/task`;
-    for(const tid of fs.readdirSync(dir)){
-      const kids=fs.readFileSync(`${dir}/${tid}/children`,'utf8').trim().split(/\s+/).filter(Boolean);
-      for(const k of kids){try{if(/python/.test(fs.readFileSync(`/proc/${k}/cmdline`,'utf8')))return Number(k)}catch{}}
+    let frontier=[pid];
+    for(let depth=0;depth<6;depth++){
+      const next=[];
+      for(const p of frontier){
+        try{
+          const dir=`/proc/${p}/task`;
+          for(const tid of fs.readdirSync(dir)){
+            let kids=[];
+            try{kids=fs.readFileSync(`${dir}/${tid}/children`,'utf8').trim().split(/\s+/).filter(Boolean).map(Number)}catch{}
+            next.push(...kids);
+          }
+        }catch{}
+      }
+      if(!next.length)break;
+      for(const k of next){if(!isShell(k))return k}
+      frontier=next;
     }
   }catch{}
   return pid;
@@ -712,13 +732,13 @@ async function getStatusProcess(id){
   if(!entry)return {status:'stopped',cpuPercent:0,memoryMb:0,memoryLimitMb:planMemoryMb(),uptime:0,mode:'process',plan:'free'};
   const pid=resolveMainPid(entry.child.pid);let cpuPercent=null,memoryMb=null;
   try{
-    const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8').split(' ');
-    const ticks=Number(stat[13])+Number(stat[14])+Number(stat[15])+Number(stat[16]);
+    const raw=fs.readFileSync(`/proc/${pid}/stat`,'utf8');
+    const rest=raw.slice(raw.lastIndexOf(')')+2).split(' ');
+    const ticks=Number(rest[11])+Number(rest[12])+Number(rest[13])+Number(rest[14]);
     const now=Date.now();const prev=entry.lastSample;
     if(prev&&now>prev.t){const dt=(now-prev.t)/1000;cpuPercent=Math.max(0,Math.min(100*os.cpus().length,((ticks-prev.ticks)/100/dt)*100))}
     entry.lastSample={t:now,ticks};
-    const rss=fs.readFileSync(`/proc/${pid}/status`,'utf8').match(/VmRSS:\s+(\d+)\s+kB/);
-    if(rss)memoryMb=Math.round(Number(rss[1])/1024);
+    memoryMb=Math.round(groupRssMb(id));
   }catch{}
   return {status:'online',cpuPercent,memoryMb,memoryLimitMb:planMemoryMb(),uptime:Math.max(0,Math.floor((Date.now()-entry.startedAt)/1000)),mode:'process',plan:'free'};
 }
