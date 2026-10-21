@@ -574,8 +574,9 @@ async function handle(request, env, method, path, url, ip) {
     if (!crashed) return json({ ok: true });
     const exitText = `Process exited ${code === null ? `on signal ${signal}` : `with exit code ${code}`}${uptimeSec ? ` after ${uptimeSec}s` : ''}.`;
     const reason = reasonCode === 'memory_limit'
-      ? `Process exceeded the ${memoryLimitMb || 512} MB memory limit of the Free plan${memoryKilledMb ? ` (was using about ${memoryKilledMb} MB)` : ''} and was stopped.`
+      ? `Process exceeded the Free plan's memory budget${memoryKilledMb ? ` (was using about ${memoryKilledMb} MB)` : ''} and was stopped.`
       : `${exitText}${fatalLine ? ` Last fatal output: ${fatalLine}` : ''}`;
+    const finalStatus = reasonCode === 'memory_limit' ? 'stopped' : 'failed';
     const aes = await aesKey(env);
     const secrets = aes ? (await readEnv(env, p.id, aes)).map((x) => x.value) : [];
     let deployment = null;
@@ -587,15 +588,15 @@ async function handle(request, env, method, path, url, ip) {
         await env.DB.prepare("UPDATE deployments SET status='failed',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
           .bind(maskSecrets(`Deployment failed: ${reason}`, secrets), now, Math.max(0, Date.now() - Date.parse(deployment.created_at)), deployment.id).run();
       }
-      await env.DB.prepare("UPDATE projects SET status='failed',updated_at=? WHERE id=? AND status='deploying'").bind(now, projectId).run();
+      await env.DB.prepare("UPDATE projects SET status=?,updated_at=? WHERE id=? AND status='deploying'").bind(finalStatus, now, projectId).run();
       await addActivity(env, p.user_id, projectId, 'deployment_failed', `${p.name} deployment failed: ${exitText}`);
     } else if (deployment && deployment.status === 'success' && deployment.finished_at && Date.now() - Date.parse(deployment.finished_at) < 5 * 60 * 1000) {
       await env.DB.prepare("UPDATE deployments SET status='failed',summary=? WHERE id=?").bind(maskSecrets(`Runtime crash: ${reason}`, secrets), deployment.id).run();
-      await env.DB.prepare("UPDATE projects SET status='failed',updated_at=? WHERE id=? AND status <> 'deploying'").bind(now, projectId).run();
+      await env.DB.prepare("UPDATE projects SET status=?,updated_at=? WHERE id=? AND status <> 'deploying'").bind(finalStatus, now, projectId).run();
       await addActivity(env, p.user_id, projectId, 'deployment_failed', `${p.name} crashed after deployment: ${exitText}`);
     } else {
       await addActivity(env, p.user_id, projectId, 'deployment_failed', `${p.name} process exited unexpectedly: ${exitText}`);
-      await env.DB.prepare("UPDATE projects SET status='failed',updated_at=? WHERE id=? AND status='online'").bind(now, projectId).run();
+      await env.DB.prepare("UPDATE projects SET status=?,updated_at=? WHERE id=? AND status='online'").bind(finalStatus, now, projectId).run();
     }
     return json({ ok: true });
   }

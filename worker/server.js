@@ -499,6 +499,7 @@ function spawnBot(id,secrets,deploymentId){
         }else writeMeta(id,{...meta,consecutiveFastExits:n});
       }else if(meta&&meta.startCommand&&uptimeSec>=60000&&meta.consecutiveFastExits){writeMeta(id,{...meta,consecutiveFastExits:0})}
     }catch{}
+    if(entry.memoryKilled){try{const meta=readMeta(id);if(meta)writeMeta(id,{...meta,autoStart:false});const dis=runtimeLogger(id,getSecrets(id));dis.line('[OrbitHost worker] Auto-start disabled after the memory limit was hit. Fix the memory usage, then start the project manually.');dis.end()}catch{}}
     reportProcessExit(id,{projectId:id,exitCode:code===null?null:code,signal:signal||'',uptimeSec,deploymentId:entry.deploymentId||'',fatalLine,reasonCode:entry.memoryKilled?'memory_limit':'',memoryKilledMb:entry.memoryKilled?entry.memoryKilled.mb:null,memoryLimitMb:entry.memoryKilled?entry.memoryKilled.limitMb:null});
   });
   child.on('error',(error)=>{try{logger.line(`[OrbitHost worker] Process failed to start: ${error.message}.`);logger.end()}catch{}});
@@ -792,17 +793,19 @@ const memoryTimer=setInterval(()=>{
   for(const [id,entry] of [...procs.entries()]){
     if(entry.stopRequested||entry.memoryKilled)continue;
     let mb=0;try{mb=groupRssMb(id)}catch{}
-    const limit=planMemoryMb();
+    const planMb=planMemoryMb();
+    const containerMb=Math.min(planMb,Math.round(os.totalmem()/1048576))||planMb;
+    const limit=Math.max(64,containerMb-96);
     if(mb>limit){
       entry.memoryKilled={mb:Math.round(mb),limitMb:limit};
       memoryWatchdogState.kills.push({id,mb:Math.round(mb),at:memoryWatchdogState.lastRunAt});
       if(memoryWatchdogState.kills.length>50)memoryWatchdogState.kills.shift();
-      try{const lg=runtimeLogger(id,getSecrets(id));lg.line(`[OrbitHost worker] Process stopped: memory usage ${Math.round(mb)} MB exceeded the ${limit} MB memory limit of the Free plan.`);lg.end()}catch{}
+      try{const lg=runtimeLogger(id,getSecrets(id));lg.line(`[OrbitHost worker] Process stopped: memory usage ${Math.round(mb)} MB exceeded the Free plan memory budget (effective limit ${limit} MB on this worker).`);lg.end()}catch{}
       try{process.kill(-entry.child.pid,'SIGKILL')}catch{try{entry.child.kill('SIGKILL')}catch{}}
       try{for(const pid of fs.readdirSync('/proc').filter(n=>/^\d+$/.test(n)).map(Number)){const cmd=fs.readFileSync(`/proc/${pid}/cmdline`,'utf8');if(cmd&&cmd.includes(projectPath(id))&&pid!==process.pid){try{process.kill(-pid,'SIGKILL')}catch{try{process.kill(pid,'SIGKILL')}catch{}}}}}catch{}
     }
   }
-},10000);
+},1000);
 memoryTimer.unref?.();
 const restoreState={ranAt:null,attempts:[],results:[]};
 async function restoreFromControlPlane(){
