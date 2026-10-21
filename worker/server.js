@@ -988,6 +988,29 @@ app.post('/v1/projects/:id/deploy',upload.single('bundle'),(req,res)=>{req.body=
 app.get('/v1/restore/run',async(req,res)=>{try{await restoreFromControlPlane()}catch(e){console.log(`[OrbitHost worker] Manual restore failed: ${e.message}`)}res.json(restoreState)});
 app.get('/v1/restore/status',(req,res)=>res.json(restoreState));
 app.get('/v1/watchdog/status',(req,res)=>res.json({...watchdogState,memory:memoryWatchdogState,activeDeploys:[...activeDeploys]}));
+
+app.post('/v1/tools/gmail-check',async(req,res)=>{
+  try{
+    const email=String(req.body&&req.body.email||'').trim().toLowerCase();
+    if(!/^[a-z0-9._%+-]+@gmail\.com$/.test(email))return res.status(400).json({error:'Invalid Gmail address.'});
+    const deliverable=await new Promise((resolve)=>{
+      let done=false;const s=net.createConnection({host:'gmail-smtp-in.l.google.com',port:25});
+      const fin=(v)=>{if(!done){done=true;try{s.destroy()}catch{};resolve(v)}};
+      s.setTimeout(7000,()=>fin(null));
+      s.on('error',()=>fin(null));
+      let stage=0;
+      s.on('data',(buf)=>{
+        const lines=buf.toString('utf8').split(/\r?\n/).filter(Boolean);
+        const code=lines.length?parseInt(lines[lines.length-1].slice(0,3),10):0;
+        if(stage===0){if(code!==220)return fin(null);s.write('EHLO orbithost.pages.dev\r\n');stage=1}
+        else if(stage===1){if(code!==250)return fin(null);s.write('MAIL FROM:<probe@orbithost.pages.dev>\r\n');stage=2}
+        else if(stage===2){if(code!==250)return fin(null);s.write(`RCPT TO:<${email}>\r\n`);stage=3}
+        else if(stage===3){try{s.write('QUIT\r\n')}catch{};if(code===250||code===251)return fin(true);if(code===550||code===551||code===553)return fin(false);fin(null)}
+      });
+    });
+    res.json({email,deliverable});
+  }catch(e){res.status(400).json({error:e&&e.message||'Check failed.'})}
+});
 app.get('/v1/projects/:id/deploy-state',(req,res)=>{const id=req.params.id;if(!validId(id))return res.status(400).json({error:'Invalid project ID.'});const state=readDeployState(id);res.json({active:activeDeploys.has(id),state})});
 app.get('/v1/procs',(req,res)=>res.json({processes:[...procs.entries()].map(([id,e])=>({id,pid:e&&e.child?e.child.pid:null}))}));
 app.post('/v1/projects/:id/action',async(req,res)=>{try{const result=await actionImpl(req.params.id,req.body?.action);if(req.body?.action==='start')restartBackoff.delete(req.params.id);res.json(result)}catch(error){res.status(400).json({error:redact(error.message,getSecrets(req.params.id))})}});
