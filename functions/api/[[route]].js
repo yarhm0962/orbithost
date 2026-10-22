@@ -435,7 +435,7 @@ function ensureSchema(env) {
       const legacyRows = await rows(env.DB.prepare("SELECT id, user_id, name FROM projects WHERE kind = '' AND parent_id IS NULL AND source_type IN ('zip','git') AND is_sample = 0"));
       for (const row of (legacyRows || [])) {
         const gid = crypto.randomUUID(); const gts = nowISO();
-        await env.DB.prepare("INSERT INTO projects(id,user_id,name,source_type,kind,status,is_sample,created_at,updated_at) VALUES(?,?,?,?,?,?,?,0,?,?)").bind(gid, row.user_id, row.name, 'demo', 'group', 'stopped', gts, gts).run();
+        await env.DB.prepare("INSERT INTO projects(id,user_id,name,source_type,kind,status,is_sample,created_at,updated_at) VALUES(?,?,?,?,?,?,0,?,?)").bind(gid, row.user_id, row.name, 'demo', 'group', 'stopped', gts, gts).run();
         await env.DB.prepare('UPDATE projects SET parent_id=? WHERE id=?').bind(gid, row.id).run();
       }
     }).catch((error) => { schemaPromise = null; throw error; });
@@ -633,7 +633,7 @@ export async function onRequest({ request, env, ctx }) {
   } catch (error) {
     if (error instanceof ApiError) return json({ error: error.message }, error.status);
     console.error(`[orbithost] ${method} ${path}:`, error && error.message ? error.message : error);
-    return json({ error: 'Something went wrong while processing that request. Check the project logs and server configuration.', debug: String(error && error.stack || error && error.message || error).slice(0, 600) }, 500);
+    return json({ error: 'Something went wrong while processing that request. Check the project logs and server configuration.' }, 500);
   }
 }
 
@@ -1206,7 +1206,7 @@ async function handle(request, env, method, path, url, ip, ctx) {
       const groupCount = (await first(env.DB.prepare("SELECT COUNT(*) AS c FROM projects WHERE user_id=? AND kind='group'").bind(userId))).c;
       if (groupCount >= 3) return json({ error: 'Project limit reached: you can create up to 3 projects.' }, 403);
       const id = crypto.randomUUID(); const ts = nowISO();
-      await env.DB.prepare("INSERT INTO projects(id,user_id,name,source_type,kind,status,is_sample,created_at,updated_at) VALUES(?,?,?,?,?,?,?,0,?,?)").bind(id, userId, name, 'demo', 'group', 'stopped', ts, ts).run();
+      await env.DB.prepare("INSERT INTO projects(id,user_id,name,source_type,kind,status,is_sample,created_at,updated_at) VALUES(?,?,?,?,?,?,0,?,?)").bind(id, userId, name, 'demo', 'group', 'stopped', ts, ts).run();
       await addActivity(env, userId, id, 'project_created', `${name} project was created.`);
       return json({ project: await projectView(env, await ownerProject(env, userId, id)) }, 201);
     }
