@@ -633,7 +633,7 @@ export async function onRequest({ request, env, ctx }) {
   } catch (error) {
     if (error instanceof ApiError) return json({ error: error.message }, error.status);
     console.error(`[orbithost] ${method} ${path}:`, error && error.message ? error.message : error);
-    return json({ error: 'Something went wrong while processing that request. Check the project logs and server configuration.' }, 500);
+    return json({ error: 'Something went wrong while processing that request. Check the project logs and server configuration.', debug: String(error && error.stack || error && error.message || error).slice(0, 600) }, 500);
   }
 }
 
