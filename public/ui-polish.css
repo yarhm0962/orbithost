@@ -643,3 +643,20 @@ html.overlay-locked, body.overlay-locked { overflow: hidden !important; }
 .cap-count{font-size:10px;color:#8c98b3;font-weight:650}
 .project-row .project-side{flex-wrap:wrap;justify-content:flex-end;row-gap:6px}
 @media(max-width:700px){.project-grid{grid-template-columns:1fr;gap:10px}.project-card{padding:13px}.cap-mini .cap-track{width:84px}}
+
+/* Modal + project page polish */
+.panel+.panel{margin-top:15px}
+.bot-actions{display:flex;align-items:center;gap:6px}
+.page-heading>.button.button-keep-label .button-copy{display:inline}
+.project-meta span:first-child{min-width:0;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.field-input::placeholder,.field-textarea::placeholder{color:#7e8ba7}
+.modal-footer{padding:18px 0 6px}
+@media(max-width:700px){
+  .modal-backdrop{padding:16px}
+  .modal-footer{gap:8px}
+  .modal-footer .button{flex:1;justify-content:center}
+  .project-row{flex-wrap:wrap}
+  .project-row .project-main{flex:1 1 calc(100% - 44px)}
+  .project-row .project-side{width:100%;justify-content:space-between;margin-top:11px;padding-top:11px;border-top:1px solid rgba(39,49,73,.6)}
+  .danger-zone .button{width:100%;justify-content:center}
+}
