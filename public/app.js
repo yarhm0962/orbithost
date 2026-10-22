@@ -462,7 +462,7 @@ function render() {
   const focusedId=document.activeElement?.id;
   const selectionStart=typeof document.activeElement?.selectionStart==='number'?document.activeElement.selectionStart:null;
   const selectionEnd=typeof document.activeElement?.selectionEnd==='number'?document.activeElement.selectionEnd:null;
-  if(!state.user) { stopLiveLogs(); if(insightsTimer){clearInterval(insightsTimer);insightsTimer=null;} app.innerHTML=renderAuth(); startAuthInsights(); }
+  if(!state.user) { stopLiveLogs(); state.mobileNavOpen=false; state.modal=null; if(insightsTimer){clearInterval(insightsTimer);insightsTimer=null;} app.innerHTML=renderAuth(); startAuthInsights(); }
   else {
     let content='';
     if(state.activePage==='overview')content=renderOverview();
@@ -684,7 +684,7 @@ async function confirmDelete() {
 }
 async function logout() {
   try{await api('/api/auth/logout',{method:'POST',body:{}})}catch{}
-  stopLiveLogs();state.user=null;state.dashboard=null;state.activeProject=null;state.activePage='overview';state.csrf='';state.authMode='login';
+  stopLiveLogs();state.user=null;state.dashboard=null;state.activeProject=null;state.activePage='overview';state.csrf='';state.authMode='login';state.mobileNavOpen=false;state.modal=null;
   try{const t=await api('/api/auth/csrf');state.csrf=t.csrfToken}catch{}
   render();showToast('You have signed out.');
 }

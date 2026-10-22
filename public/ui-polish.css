@@ -650,7 +650,7 @@ html.overlay-locked, body.overlay-locked { overflow: hidden !important; }
 .page-heading>.button.button-keep-label .button-copy{display:inline}
 .project-meta span:first-child{min-width:0;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .field-input::placeholder,.field-textarea::placeholder{color:#7e8ba7}
-.modal-footer{padding:18px 0 6px}
+.modal-footer{padding:18px 0 16px}
 @media(max-width:700px){
   .modal-backdrop{padding:16px}
   .modal-footer{gap:8px}
@@ -683,4 +683,10 @@ html.overlay-locked, body.overlay-locked { overflow: hidden !important; }
 .modal-header,.modal-footer{flex-shrink:0}
 @media(max-width:700px){
   .modal-backdrop{align-items:center;place-items:center}
+}
+
+/* Auth page: normal document flow on small screens so it always scrolls */
+@media(max-width:980px){
+  .auth-form-side{display:block;min-height:100svh;padding:28px 20px 44px}
+  .auth-form-wrap{margin:0 auto}
 }
