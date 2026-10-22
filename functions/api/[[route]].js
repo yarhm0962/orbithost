@@ -329,6 +329,24 @@ async function deployWithWorker(env, p, deploymentId) {
   form.set('deploymentId', deploymentId);
   if (p.source_type === 'git') {
     form.set('repositoryUrl', p.repository_url || '');
+    const repoUrl = p.repository_url || '';
+    if (p.user_id && /^https:\/\/github\.com\//.test(repoUrl)) {
+      try {
+        const urow = await first(env.DB.prepare('SELECT github_token FROM users WHERE id = ?').bind(p.user_id));
+        let gtoken = '';
+        try { const k = await aesKey(env); if (k && urow && urow.github_token) gtoken = await decryptText(String(urow.github_token), k); } catch {}
+        if (gtoken) {
+          const slug = new URL(repoUrl).pathname.replace(/\.git$/, '').replace(/^\/+|\/+$/g, '');
+          if (/^[^\/]+\/[^\/]+$/.test(slug)) {
+            const info = await fetch(`https://api.github.com/repos/${slug}`, { headers: { authorization: `Bearer ${gtoken}`, accept: 'application/vnd.github+json', 'user-agent': 'OrbitHost' }, signal: AbortSignal.timeout(8000) });
+            if (info.ok) {
+              const meta = await info.json();
+              if (meta && meta.private) form.set('repositoryUrl', `https://x-access-token:${encodeURIComponent(gtoken)}@github.com/${slug}.git`);
+            }
+          }
+        }
+      } catch {}
+    }
   } else if (p.source_type === 'zip' && p.source_bundle) {
     const bundle = await loadBundle(env, p.source_bundle);
     if (!bundle || !bundle.length) throw new ApiError(400, 'The uploaded source archive is missing. Re-upload the project.');
@@ -895,10 +913,10 @@ async function handle(request, env, method, path, url, ip) {
     let token = '';
     try { const key = await aesKey(env); if (key && row.github_token) token = await decryptText(String(row.github_token), key); } catch {}
     if (!token) return json({ connected: true, repos: [] });
-    let list = null; let publicOnly = false;
+    let list = null; let publicOnly = false; let tokenOk = false;
     try {
       const res = await fetch('https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member', { headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'OrbitHost' }, signal: AbortSignal.timeout(8000) });
-      if (res.ok) { const l = await res.json(); if (Array.isArray(l) && l.length) list = l; }
+      if (res.ok) { tokenOk = true; const l = await res.json(); if (Array.isArray(l) && l.length) list = l; }
     } catch {}
     if (!list) {
       publicOnly = true;
@@ -918,7 +936,7 @@ async function handle(request, env, method, path, url, ip) {
     }
     const repos = (Array.isArray(list) ? list : []).map((r) => ({ name: r.full_name || r.name, cloneUrl: r.clone_url || '', private: Boolean(r.private), updatedAt: r.updated_at || '', description: r.description || '' }));
     repos.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
-    return json({ connected: true, repos, publicOnly });
+    return json({ connected: true, repos, publicOnly, needsPermissions: !tokenOk });
   }
 
   if (path === '/auth/github/disconnect' && method === 'POST') {
