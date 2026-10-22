@@ -186,7 +186,7 @@ function statCard(label,value,ic,foot,opts={}) {
   return `<div class="stat-card" style="--glow:${opts.glow||'rgba(147,135,255,.08)'}"><div class="stat-top"><span>${label}</span><span class="stat-icon" style="--icon-bg:${opts.bg||'rgba(147,135,255,.12)'};--icon-color:${opts.color||'#a79bff'}">${icon(ic)}</span></div><div class="stat-value">${value}</div><div class="stat-foot">${foot}</div></div>`;
 }
 function projectCard(p) {
-  if(p.sourceType==='group'){
+  if(p.kind==='group'){
     const bc=p.botCount||0;
     return `<article class="project-row" data-project-search="${esc((p.name+' project bots').toLowerCase())}"><div class="project-avatar">${icon('boxes')}</div><div class="project-main"><div class="project-name"><span>${esc(p.name)}</span></div><div class="project-meta"><span>${bc}/5 bots</span><span class="meta-dot"></span><span>${bc?'Open to manage bots':'No bots yet'}</span></div></div><div class="project-side"><button class="icon-button" data-open-project="${esc(p.id)}" aria-label="Open ${esc(p.name)}" title="Open project">${icon('chevronRight')}</button></div></article>`;
   }
@@ -438,7 +438,7 @@ function render() {
     else if(state.activePage==='projects')content=renderProjects();
     else if(state.activePage==='activity')content=renderActivity();
     else if(state.activePage==='settings')content=renderSettings();
-    else if(state.activePage==='project')content=(state.activeProject?.project?.sourceType==='group')?renderGroupPage():renderDetail();
+    else if(state.activePage==='project')content=(state.activeProject?.project?.kind==='group')?renderGroupPage():renderDetail();
     else content=renderOverview();
     app.innerHTML=shell(content);
   }
