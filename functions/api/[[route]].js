@@ -229,6 +229,7 @@ async function workerRequest(env, route, options = {}, timeoutMs = Number(env.WO
   } finally { clearTimeout(timer); }
 }
 
+let statsCache = { at: 0, data: null };
 const STALE_DEPLOY_MS = 45 * 60 * 1000;
 async function sweepStaleDeploy(env, p) {
   if (!p || p.status !== 'deploying') return p;
@@ -680,6 +681,35 @@ async function handle(request, env, method, path, url, ip, ctx) {
       if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(run()); else await run();
     }
     return json({ ok: true, triggered, skipped });
+  }
+  if (method === 'GET' && path === '/stats') {
+    const nowMs = Date.now();
+    if (statsCache.data && nowMs - statsCache.at < 15000) return json({ ...statsCache.data, cached: true });
+    const cnt = (r) => (r && Number(r.c)) || 0;
+    const [liveOnline, botsRow, groupsRow, deploysRow, onlineRow] = await Promise.all([
+      (async () => {
+        try {
+          const d = await workerRequest(env, '/v1/procs', {}, 3000);
+          const list = Array.isArray(d && d.processes) ? d.processes : [];
+          return list.filter((proc) => proc && proc.pid).length;
+        } catch { return null; }
+      })(),
+      first(env.DB.prepare("SELECT COUNT(*) AS c FROM projects WHERE kind = '' AND is_sample = 0")),
+      first(env.DB.prepare("SELECT COUNT(*) AS c FROM projects WHERE kind = 'group'")),
+      first(env.DB.prepare('SELECT COUNT(*) AS c FROM deployments')),
+      first(env.DB.prepare("SELECT COUNT(*) AS c FROM projects WHERE kind = '' AND is_sample = 0 AND status = 'online'"))
+    ]);
+    const data = {
+      ok: true,
+      online: liveOnline !== null ? liveOnline : cnt(onlineRow),
+      source: liveOnline !== null ? 'live' : 'database',
+      bots: cnt(botsRow),
+      projects: cnt(groupsRow),
+      deploys: cnt(deploysRow),
+      checkedAt: nowISO()
+    };
+    statsCache = { at: nowMs, data };
+    return json(data);
   }
   if (method === 'GET' && path === '/config') {
     let workerReady = false;

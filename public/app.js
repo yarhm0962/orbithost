@@ -369,7 +369,7 @@ function renderRegisterWizard() {
 function renderAuth() {
   const registering=state.authMode==='register';
   const ghBlock = state.config?.githubEnabled ? `<div class="auth-divider"><span>or</span></div><a class="button button-github" href="/api/auth/github/start">${icon('github')}<span>Continue with GitHub</span></a><div class="github-hint">Uses your existing GitHub account. Your workspace is created automatically the first time you sign in.</div>` : '';
-  return `<div class="auth-screen"><section class="auth-showcase"><div class="auth-brand"><div class="brand-mark"><svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="13"/><ellipse cx="20" cy="20" rx="18" ry="7" transform="rotate(-35 20 20)"/><circle class="mark-dot" cx="31" cy="10" r="2.5"/></svg></div><div><div class="brand-name">OrbitHost</div><div class="brand-tagline">Bot infrastructure</div></div></div><div class="auth-copy"><div class="eyebrow">A home for your Discord bots</div><h1>Less server babysitting.<br><span>More building.</span></h1><p>Keep your bot projects, secrets, deployment history, and runtime logs in one calm, focused workspace.</p><div class="auth-feature-list"><div class="auth-feature"><span class="feature-icon">${icon('rocket')}</span>Deploy from a ZIP or Git repository</div><div class="auth-feature"><span class="feature-icon">${icon('lock')}</span>Encrypted environment variables</div><div class="auth-feature"><span class="feature-icon">${icon('terminal')}</span>Searchable logs and deployment history</div></div></div><div class="auth-foot">OrbitHost · Built for developers who ship bots.</div></section><section class="auth-form-side"><div class="auth-form-wrap"><div class="auth-mobile-brand"><div class="brand-mark"><svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="13"/><ellipse cx="20" cy="20" rx="18" ry="7" transform="rotate(-35 20 20)"/><circle class="mark-dot" cx="31" cy="10" r="2.5"/></svg></div><div><div class="brand-name">OrbitHost</div><div class="brand-tagline">Bot infrastructure</div></div></div><div class="auth-form-heading"><div class="eyebrow">Your workspace awaits</div><h2>${registering?'Create your account':'Welcome back'}</h2><p>${registering?'Start organizing and deploying your Discord bot projects.':'Sign in to continue to your bot workspace.'}</p></div><div id="auth-alert" class="auth-alert" role="alert"></div>${state.authNotice?`<div class="github-error" role="alert">${esc(state.authNotice)}</div>`:''}${registering?renderRegisterWizard():`<form class="auth-form" data-form="auth"><div class="field"><label class="field-label" for="auth-email">Email address</label><input class="field-input" id="auth-email" name="email" type="email" autocomplete="email" placeholder="you@example.com" maxlength="254" required></div><div class="field"><label class="field-label" for="auth-password">Password</label><input class="field-input" id="auth-password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" maxlength="128" required></div><button class="button button-primary auth-submit" type="submit">Sign in ${icon('chevronRight')}</button></form>`}${ghBlock}<div class="auth-switch">${registering?'Already have an account?':'New to OrbitHost?'} <button type="button" data-auth-mode="${registering?'login':'register'}">${registering?'Sign in':'Create an account'}</button></div><div class="auth-footnote">By continuing, you agree to use this platform responsibly. Real bot uptime depends on your configured hosting infrastructure.</div></div></section>${state.verify?renderVerifyOverlay():''}</div>`;
+  return `<div class="auth-screen"><section class="auth-showcase"><div class="auth-brand"><div class="brand-mark"><svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="13"/><ellipse cx="20" cy="20" rx="18" ry="7" transform="rotate(-35 20 20)"/><circle class="mark-dot" cx="31" cy="10" r="2.5"/></svg></div><div><div class="brand-name">OrbitHost</div><div class="brand-tagline">Bot infrastructure</div></div></div><div class="auth-copy"><div class="eyebrow">A home for your Discord bots</div><h1>Less server babysitting.<br><span>More building.</span></h1><p>Keep your bot projects, secrets, deployment history, and runtime logs in one calm, focused workspace.</p><div class="auth-feature-list"><div class="auth-feature"><span class="feature-icon">${icon('rocket')}</span>Deploy from a ZIP or Git repository</div><div class="auth-feature"><span class="feature-icon">${icon('lock')}</span>Encrypted environment variables</div><div class="auth-feature"><span class="feature-icon">${icon('terminal')}</span>Searchable logs and deployment history</div></div></div><div class="auth-foot">OrbitHost · Built for developers who ship bots.</div></section><section class="auth-form-side"><div class="auth-form-wrap"><div class="auth-mobile-brand"><div class="brand-mark"><svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="13"/><ellipse cx="20" cy="20" rx="18" ry="7" transform="rotate(-35 20 20)"/><circle class="mark-dot" cx="31" cy="10" r="2.5"/></svg></div><div><div class="brand-name">OrbitHost</div><div class="brand-tagline">Bot infrastructure</div></div></div><div class="auth-form-heading"><div class="eyebrow">Your workspace awaits</div><h2>${registering?'Create your account':'Welcome back'}</h2><p>${registering?'Start organizing and deploying your Discord bot projects.':'Sign in to continue to your bot workspace.'}</p></div><div id="auth-insights" class="auth-insights" aria-live="polite"><div class="ai-head"><span class="ai-live"><span class="ai-dot"></span>Live platform insights</span><span class="ai-updated" id="ai-updated">Connecting…</span></div><div class="ai-grid"><div class="ai-tile"><div class="ai-num" id="ai-online">–</div><div class="ai-label">Bots online now</div></div><div class="ai-tile"><div class="ai-num" id="ai-bots">–</div><div class="ai-label">Bots hosted</div></div><div class="ai-tile"><div class="ai-num" id="ai-projects">–</div><div class="ai-label">Projects</div></div><div class="ai-tile"><div class="ai-num" id="ai-deploys">–</div><div class="ai-label">Deployments</div></div></div></div><div id="auth-alert" class="auth-alert" role="alert"></div>${state.authNotice?`<div class="github-error" role="alert">${esc(state.authNotice)}</div>`:''}${registering?renderRegisterWizard():`<form class="auth-form" data-form="auth"><div class="field"><label class="field-label" for="auth-email">Email address</label><input class="field-input" id="auth-email" name="email" type="email" autocomplete="email" placeholder="you@example.com" maxlength="254" required></div><div class="field"><label class="field-label" for="auth-password">Password</label><input class="field-input" id="auth-password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" maxlength="128" required></div><button class="button button-primary auth-submit" type="submit">Sign in ${icon('chevronRight')}</button></form>`}${ghBlock}<div class="auth-switch">${registering?'Already have an account?':'New to OrbitHost?'} <button type="button" data-auth-mode="${registering?'login':'register'}">${registering?'Sign in':'Create an account'}</button></div><div class="auth-footnote">By continuing, you agree to use this platform responsibly. Real bot uptime depends on your configured hosting infrastructure.</div></div></section>${state.verify?renderVerifyOverlay():''}</div>`;
 }
 function renderModal() {
   const m=state.modal;if(!m)return '';
@@ -424,6 +424,37 @@ function startVerifyTicker(){
     btn.textContent=left>0?`Resend code in ${left}s`:'Resend code';
   },1000);
 }
+let insightsTimer = null;
+function startAuthInsights() {
+  const box = document.getElementById('auth-insights');
+  if (!box) return;
+  if (insightsTimer) { clearInterval(insightsTimer); insightsTimer = null; }
+  const ids = { online: 'ai-online', bots: 'ai-bots', projects: 'ai-projects', deploys: 'ai-deploys' };
+  const animate = (id, to) => {
+    const el = document.getElementById(id); if (!el) return;
+    const from = Number(el.textContent) || 0;
+    if (from === to) { el.textContent = String(to); return; }
+    const t0 = performance.now(), dur = 650;
+    const step = (t) => { const k = Math.min(1, (t - t0) / dur); el.textContent = String(Math.round(from + (to - from) * (1 - Math.pow(1 - k, 3)))); if (k < 1) requestAnimationFrame(step); };
+    requestAnimationFrame(step);
+  };
+  const upd = document.getElementById('ai-updated');
+  const render = (d) => {
+    for (const key in ids) animate(ids[key], Number(d[key]) || 0);
+    if (upd) upd.textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  };
+  const load = async () => {
+    try {
+      const r = await fetch('/api/stats');
+      if (!r.ok) throw new Error('bad status');
+      const d = await r.json();
+      if (!d || !d.ok) throw new Error('bad payload');
+      render(d);
+    } catch { if (upd) upd.textContent = 'Reconnecting…'; }
+  };
+  load();
+  insightsTimer = setInterval(load, 20000);
+}
 function render() {
   const app=$('#app');if(!app)return;
   closeAllDropdowns();
@@ -431,7 +462,7 @@ function render() {
   const focusedId=document.activeElement?.id;
   const selectionStart=typeof document.activeElement?.selectionStart==='number'?document.activeElement.selectionStart:null;
   const selectionEnd=typeof document.activeElement?.selectionEnd==='number'?document.activeElement.selectionEnd:null;
-  if(!state.user) { stopLiveLogs(); app.innerHTML=renderAuth(); }
+  if(!state.user) { stopLiveLogs(); if(insightsTimer){clearInterval(insightsTimer);insightsTimer=null;} app.innerHTML=renderAuth(); startAuthInsights(); }
   else {
     let content='';
     if(state.activePage==='overview')content=renderOverview();
