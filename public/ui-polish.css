@@ -623,3 +623,23 @@ html.overlay-locked, body.overlay-locked { overflow: hidden !important; }
   .dd-btn { min-height: 44px; font-size: 12px; }
   .log-toolbar .dd { min-width: 132px; max-width: 168px; }
 }
+
+/* Projects page rebuild: card grid + capacity bars */
+.project-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(225px,1fr));gap:12px}
+.project-card{display:flex;flex-direction:column;padding:15px;border:1px solid #252f46;border-radius:14px;background:linear-gradient(160deg,rgba(20,28,46,.92),rgba(14,20,34,.94));min-width:0;cursor:pointer;transition:border-color .15s,background .15s,transform .15s}
+.project-card:hover{border-color:#4b467e;background:#182239;transform:translateY(-2px)}
+.project-card-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px}
+.project-card-name{font-size:13px;font-weight:730;letter-spacing:-.2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.project-card-meta{font-size:10px;color:#8c98b3;margin-top:5px;line-height:1.55}
+.project-card-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:13px;padding-top:11px;border-top:1px solid rgba(39,49,73,.6);font-size:10px;font-weight:650;color:#b8aeff}
+.project-card-foot .icon{width:13px;height:13px}
+.bot-chip{font-size:10px;font-weight:650;padding:4px 8px;border-radius:7px;background:#212a3c;color:#aab4c9;white-space:nowrap}
+.bot-chip.full{color:var(--amber);background:var(--amber-soft)}
+.cap-track{height:5px;background:#273149;border-radius:10px;overflow:hidden;margin-top:13px}
+.cap-fill{height:100%;width:0;background:linear-gradient(90deg,#7868f2,#b1a6ff);border-radius:10px;transition:width .3s}
+.cap-fill.full{background:linear-gradient(90deg,#e0a83f,#f6c66e)}
+.cap-mini{display:flex;align-items:center;gap:8px}
+.cap-mini .cap-track{margin-top:0;width:104px}
+.cap-count{font-size:10px;color:#8c98b3;font-weight:650}
+.project-row .project-side{flex-wrap:wrap;justify-content:flex-end;row-gap:6px}
+@media(max-width:700px){.project-grid{grid-template-columns:1fr;gap:10px}.project-card{padding:13px}.cap-mini .cap-track{width:84px}}
