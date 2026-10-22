@@ -361,7 +361,7 @@ let schemaPromise = null;
 function ensureSchema(env) {
   if (!schemaPromise) {
     schemaPromise = env.DB.exec(DDL).then(async () => {
-      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT', 'ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0', 'ALTER TABLE users ADD COLUMN github_id INTEGER', "ALTER TABLE users ADD COLUMN provider TEXT NOT NULL DEFAULT 'password'", 'ALTER TABLE users ADD COLUMN github_token TEXT']) {
+      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT', 'ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0', 'ALTER TABLE users ADD COLUMN github_id INTEGER', "ALTER TABLE users ADD COLUMN provider TEXT NOT NULL DEFAULT 'password'", 'ALTER TABLE users ADD COLUMN github_token TEXT', 'ALTER TABLE users ADD COLUMN github_login TEXT', 'ALTER TABLE users ADD COLUMN avatar_url TEXT']) {
         try { await env.DB.prepare(statement).run(); } catch (migrationError) { if (!/duplicate column name|already exists/i.test(String(migrationError && migrationError.message || ''))) throw migrationError; }
       }
       await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users(username_lower)').run();
@@ -452,7 +452,7 @@ async function issueVerificationCode(env, email, username) {
   const sent = await sendVerificationEmail(env, email, code, username);
   return { sent: sent.ok, error: sent.error };
 }
-function publicUser(row) { return { id: row.id, email: row.email, username: row.username || null, createdAt: row.created_at, provider: row.provider || 'password', github: row.github_id != null }; }
+function publicUser(row) { return { id: row.id, email: row.email, username: row.username || null, createdAt: row.created_at, provider: row.provider || 'password', github: row.github_id != null, githubLogin: row.github_login || null, avatarUrl: row.avatar_url || null }; }
 
 async function ownerProject(env, userId, projectId) {
   return first(env.DB.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').bind(projectId, userId));
@@ -611,8 +611,24 @@ async function handle(request, env, method, path, url, ip) {
   }
   if (method === 'GET' && path === '/auth/me') {
     if (!session?.u) return json({ user: null });
-    const user = await first(env.DB.prepare('SELECT id,email,created_at,provider,github_id FROM users WHERE id = ?').bind(session.u));
+    let user = await first(env.DB.prepare('SELECT id,email,created_at,provider,github_id,github_login,avatar_url,github_token FROM users WHERE id = ?').bind(session.u));
     if (!user) return json({ user: null }, 200, { 'set-cookie': await clearSessionCookie() });
+    if (user.github_id != null && (!user.github_login || !user.avatar_url) && user.github_token) {
+      try {
+        const key = await aesKey(env);
+        const token = key ? await decryptText(String(user.github_token), key) : '';
+        if (token) {
+          const res = await fetch('https://api.github.com/user', { headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'OrbitHost' }, signal: AbortSignal.timeout(8000) });
+          if (res.ok) {
+            const gh = await res.json();
+            if (gh && gh.login) {
+              await env.DB.prepare('UPDATE users SET github_login = ?, avatar_url = ? WHERE id = ?').bind(String(gh.login), gh.avatar_url ? String(gh.avatar_url) : null, user.id).run();
+              user = await first(env.DB.prepare('SELECT id,email,created_at,provider,github_id,github_login,avatar_url FROM users WHERE id = ?').bind(user.id));
+            }
+          }
+        }
+      } catch {}
+    }
     return json({ user: publicUser(user) });
   }
 
@@ -797,7 +813,7 @@ async function handle(request, env, method, path, url, ip) {
     const authorize = new URL('https://github.com/login/oauth/authorize');
     authorize.searchParams.set('client_id', gh.clientId);
     authorize.searchParams.set('redirect_uri', `${origin}/api/auth/github/callback`);
-    authorize.searchParams.set('scope', 'read:user user:email');
+    authorize.searchParams.set('scope', 'read:user user:email repo');
     authorize.searchParams.set('state', `${bytesToB64url(crypto.getRandomValues(new Uint8Array(24)))}.${mode}`);
     return new Response(null, { status: 302, headers: { location: authorize.toString(), 'set-cookie': `gh_oauth_state=${authorize.searchParams.get('state')}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600` } });
   }
@@ -837,7 +853,7 @@ async function handle(request, env, method, path, url, ip) {
     if (mode === 'connect') {
       const conflict = await first(env.DB.prepare('SELECT id FROM users WHERE github_id = ? AND id != ?').bind(ghId, session.u));
       if (conflict) return land('github_conflict');
-      await env.DB.prepare('UPDATE users SET github_id = ?, github_token = ? WHERE id = ?').bind(ghId, tokenCell, session.u).run();
+      await env.DB.prepare('UPDATE users SET github_id = ?, github_token = ?, github_login = ?, avatar_url = ? WHERE id = ?').bind(ghId, tokenCell, String(ghUser.login || ''), String(ghUser.avatar_url || ''), session.u).run();
       const h = new Headers({ location: '/?ghConnected=1' });
       h.append('set-cookie', 'gh_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0');
       return new Response(null, { status: 302, headers: h });
@@ -845,7 +861,7 @@ async function handle(request, env, method, path, url, ip) {
     let user = await first(env.DB.prepare('SELECT * FROM users WHERE github_id = ?').bind(ghId));
     if (!user) user = await first(env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email));
     if (user) {
-      await env.DB.prepare('UPDATE users SET github_id = ?, github_token = ?, email_verified = CASE WHEN ? THEN 1 ELSE email_verified END WHERE id = ?').bind(ghId, tokenCell, chosen.verified ? 1 : 0, user.id).run();
+      await env.DB.prepare('UPDATE users SET github_id = ?, github_token = ?, github_login = ?, avatar_url = ?, email_verified = CASE WHEN ? THEN 1 ELSE email_verified END WHERE id = ?').bind(ghId, tokenCell, String(ghUser.login || ''), String(ghUser.avatar_url || ''), chosen.verified ? 1 : 0, user.id).run();
       user = await first(env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id));
     } else {
       let base = String(ghUser.login || '').toLowerCase().replace(/-/g, '.').replace(/[^a-z0-9.]/g, '').replace(/\.{2,}/g, '.').replace(/^\.+|\.+$/g, '').slice(0, 18);
@@ -874,18 +890,35 @@ async function handle(request, env, method, path, url, ip) {
 
   if (path === '/auth/github/repos' && method === 'GET') {
     const userId = requireAuth();
-    const row = await first(env.DB.prepare('SELECT github_token, github_id FROM users WHERE id = ?').bind(userId));
+    const row = await first(env.DB.prepare('SELECT github_token, github_id, github_login FROM users WHERE id = ?').bind(userId));
     if (!row || row.github_id == null) return json({ connected: false, repos: [] });
     let token = '';
     try { const key = await aesKey(env); if (key && row.github_token) token = await decryptText(String(row.github_token), key); } catch {}
     if (!token) return json({ connected: true, repos: [] });
+    let list = null; let publicOnly = false;
     try {
       const res = await fetch('https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member', { headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'OrbitHost' }, signal: AbortSignal.timeout(8000) });
-      if (!res.ok) return json({ connected: true, repos: [] });
-      const list = await res.json();
-      const repos = (Array.isArray(list) ? list : []).map((r) => ({ name: r.full_name || r.name, cloneUrl: r.clone_url || '', private: Boolean(r.private), updatedAt: r.updated_at || '', description: r.description || '' }));
-      return json({ connected: true, repos });
-    } catch { return json({ connected: true, repos: [] }); }
+      if (res.ok) { const l = await res.json(); if (Array.isArray(l) && l.length) list = l; }
+    } catch {}
+    if (!list) {
+      publicOnly = true;
+      let login = String(row.github_login || '');
+      if (!login) {
+        try {
+          const me = await (await fetch('https://api.github.com/user', { headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'OrbitHost' }, signal: AbortSignal.timeout(8000) })).json();
+          if (me && me.login) login = String(me.login);
+        } catch {}
+      }
+      if (login) {
+        try {
+          const res2 = await fetch(`https://api.github.com/users/${encodeURIComponent(login)}/repos?per_page=100&sort=updated`, { headers: { accept: 'application/vnd.github+json', 'user-agent': 'OrbitHost' }, signal: AbortSignal.timeout(8000) });
+          if (res2.ok) { const l2 = await res2.json(); if (Array.isArray(l2)) list = l2; }
+        } catch {}
+      }
+    }
+    const repos = (Array.isArray(list) ? list : []).map((r) => ({ name: r.full_name || r.name, cloneUrl: r.clone_url || '', private: Boolean(r.private), updatedAt: r.updated_at || '', description: r.description || '' }));
+    repos.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+    return json({ connected: true, repos, publicOnly });
   }
 
   if (path === '/auth/github/disconnect' && method === 'POST') {
