@@ -426,12 +426,18 @@ let schemaPromise = null;
 function ensureSchema(env) {
   if (!schemaPromise) {
     schemaPromise = env.DB.exec(DDL).then(async () => {
-      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT', 'ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0', 'ALTER TABLE users ADD COLUMN github_id INTEGER', "ALTER TABLE users ADD COLUMN provider TEXT NOT NULL DEFAULT 'password'", 'ALTER TABLE users ADD COLUMN github_token TEXT', 'ALTER TABLE users ADD COLUMN github_login TEXT', 'ALTER TABLE users ADD COLUMN avatar_url TEXT', 'ALTER TABLE projects ADD COLUMN auto_deploy INTEGER NOT NULL DEFAULT 0']) {
+      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT', 'ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0', 'ALTER TABLE users ADD COLUMN github_id INTEGER', "ALTER TABLE users ADD COLUMN provider TEXT NOT NULL DEFAULT 'password'", 'ALTER TABLE users ADD COLUMN github_token TEXT', 'ALTER TABLE users ADD COLUMN github_login TEXT', 'ALTER TABLE users ADD COLUMN avatar_url TEXT', 'ALTER TABLE projects ADD COLUMN auto_deploy INTEGER NOT NULL DEFAULT 0', 'ALTER TABLE projects ADD COLUMN parent_id TEXT']) {
         try { await env.DB.prepare(statement).run(); } catch (migrationError) { if (!/duplicate column name|already exists/i.test(String(migrationError && migrationError.message || ''))) throw migrationError; }
       }
       await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users(username_lower)').run();
       await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS users_github_id ON users(github_id)').run();
       await env.DB.prepare('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)').run();
+      const legacyRows = await rows(env.DB.prepare("SELECT id, user_id, name FROM projects WHERE parent_id IS NULL AND source_type <> 'group'"));
+      for (const row of (legacyRows || [])) {
+        const gid = crypto.randomUUID(); const gts = nowISO();
+        await env.DB.prepare("INSERT INTO projects(id,user_id,name,source_type,status,is_sample,created_at,updated_at) VALUES(?,?,?,?,?,0,?,?)").bind(gid, row.user_id, row.name, 'group', 'stopped', gts, gts).run();
+        await env.DB.prepare('UPDATE projects SET parent_id=? WHERE id=?').bind(gid, row.id).run();
+      }
     }).catch((error) => { schemaPromise = null; throw error; });
   }
   return schemaPromise;
@@ -527,11 +533,12 @@ async function projectView(env, p) {
   const envCount = (await first(env.DB.prepare('SELECT count(*) AS count FROM env_vars WHERE project_id = ?').bind(p.id))).count;
   const deployCount = (await first(env.DB.prepare('SELECT count(*) AS count FROM deployments WHERE project_id = ?').bind(p.id))).count;
   return {
-    id: p.id, name: p.name, sourceType: p.source_type, repositoryUrl: p.repository_url,
+    id: p.id, name: p.name, sourceType: p.source_type, repositoryUrl: p.repository_url, parentId: p.parent_id || null,
     pythonVersion: p.python_version, buildCommand: p.build_command, startCommand: p.start_command,
     status: p.status, isSample: false, createdAt: p.created_at, updatedAt: p.updated_at,
     lastDeployedAt: p.last_deployed_at, environmentCount: envCount, deploymentCount: deployCount,
-    autoDeploy: !!p.auto_deploy, runtimeMode: 'container'
+    autoDeploy: !!p.auto_deploy, runtimeMode: 'container',
+    ...(p.source_type === 'group' ? { botCount: (await first(env.DB.prepare('SELECT COUNT(*) AS c FROM projects WHERE parent_id=?').bind(p.id))).c } : {})
   };
 }
 
@@ -857,7 +864,7 @@ async function handle(request, env, method, path, url, ip, ctx) {
       return json({ exists: Boolean(row) });
     }
     if (path === '/internal/worker/restore') {
-      const list = await rows(env.DB.prepare("SELECT id, source_type, repository_url, python_version, build_command, start_command, status FROM projects WHERE is_sample = 0 ORDER BY created_at ASC"));
+      const list = await rows(env.DB.prepare("SELECT id, source_type, repository_url, python_version, build_command, start_command, status FROM projects WHERE is_sample = 0 AND source_type <> 'group' ORDER BY created_at ASC"));
       const aes = await aesKey(env);
       const out = [];
       for (const p of list) {
@@ -1145,18 +1152,21 @@ async function handle(request, env, method, path, url, ip, ctx) {
 
   if (path === '/dashboard' && method === 'GET') {
     const userId = requireAuth();
-    const projectRows = await rows(env.DB.prepare('SELECT * FROM projects WHERE user_id = ? ORDER BY updated_at DESC').bind(userId));
+    const projectRows = await rows(env.DB.prepare("SELECT * FROM projects WHERE user_id = ? AND source_type='group' ORDER BY updated_at DESC").bind(userId));
     const projects = [];
+    for (const p of projectRows) projects.push(await projectView(env, p));
     const onlineUptimes = [];
-    for (const p of projectRows) projects.push(await liveProjectView(env, p, onlineUptimes));
-    const count = (status) => projects.filter((p) => p.status === status).length;
+    const botRows = await rows(env.DB.prepare('SELECT * FROM projects WHERE user_id = ? AND parent_id IS NOT NULL').bind(userId));
+    const botViews = [];
+    for (const b of botRows) botViews.push(await liveProjectView(env, b, onlineUptimes));
+    const count = (status) => botViews.filter((b) => b.status === status).length;
     const activity = (await rows(env.DB.prepare('SELECT a.id,a.action,a.message,a.created_at,p.name AS project_name FROM activities a LEFT JOIN projects p ON p.id=a.project_id WHERE a.user_id=? ORDER BY a.id DESC LIMIT 8').bind(userId)))
       .map((a) => ({ id: a.id, action: a.action, message: a.message, createdAt: a.created_at, projectName: a.project_name }));
     const deploys = await rows(env.DB.prepare('SELECT d.*,p.name AS project_name FROM deployments d JOIN projects p ON p.id=d.project_id WHERE p.user_id=? ORDER BY d.created_at DESC LIMIT 6').bind(userId));
     return json({
       projects, activity,
       recentDeployments: deploys.map((d) => ({ ...deploymentView(d), projectName: d.project_name })),
-      stats: { total: projects.length, online: count('online'), stopped: count('stopped'), deploying: count('deploying'), uptime: onlineUptimes.reduce((a, b) => a + b, 0) },
+      stats: { total: projects.length, bots: botViews.length, online: count('online'), failed: count('failed'), stopped: count('stopped'), deploying: count('deploying'), uptime: onlineUptimes.reduce((a, b) => a + b, 0) },
       hostingMode: 'worker'
     });
   }
@@ -1176,6 +1186,14 @@ async function handle(request, env, method, path, url, ip, ctx) {
     try { form = await request.formData(); } catch { fail(400, 'Upload request could not be processed.'); }
     const name = safeText(form.get('name'), 60);
     const sourceType = form.get('sourceType');
+    const parentIdRaw = form.get('parentId');
+    let parentGroup = null;
+    if (parentIdRaw) {
+      parentGroup = await first(env.DB.prepare("SELECT * FROM projects WHERE id=? AND user_id=? AND source_type='group'").bind(String(parentIdRaw), userId));
+      if (!parentGroup) return json({ error: 'Project not found.' }, 404);
+      const botCount = (await first(env.DB.prepare('SELECT COUNT(*) AS c FROM projects WHERE parent_id=?').bind(parentGroup.id))).c;
+      if (botCount >= 5) return json({ error: 'Bot limit reached: each project can hold up to 5 bots.' }, 403);
+    }
     const pythonVersion = form.get('pythonVersion') || '3.12';
     const buildCommand = safeText(form.get('buildCommand') || '', 500);
     const startCommand = safeText(form.get('startCommand') || 'python main.py', 500);
@@ -1183,13 +1201,23 @@ async function handle(request, env, method, path, url, ip, ctx) {
     if (!isValidPythonVersion(String(pythonVersion))) return json({ error: 'Choose a supported Python version.' }, 400);
     if (!startCommand) return json({ error: 'A start command is required.' }, 400);
 
+    if (!sourceType || sourceType === 'group') {
+      if (parentGroup) return json({ error: 'Choose a ZIP archive or a Git repository as the bot source.' }, 400);
+      const groupCount = (await first(env.DB.prepare("SELECT COUNT(*) AS c FROM projects WHERE user_id=? AND source_type='group'").bind(userId))).c;
+      if (groupCount >= 3) return json({ error: 'Project limit reached: you can create up to 3 projects.' }, 403);
+      const id = crypto.randomUUID(); const ts = nowISO();
+      await env.DB.prepare("INSERT INTO projects(id,user_id,name,source_type,status,is_sample,created_at,updated_at) VALUES(?,?,?,?,?,0,?,?)").bind(id, userId, name, 'group', 'stopped', ts, ts).run();
+      await addActivity(env, userId, id, 'project_created', `${name} project was created.`);
+      return json({ project: await projectView(env, await ownerProject(env, userId, id)) }, 201);
+    }
+
     if (sourceType === 'git') {
       const repositoryUrl = safeText(form.get('repositoryUrl'), 1000);
       if (!safeHttpsRepository(repositoryUrl)) return json({ error: 'Use a public HTTPS Git URL without embedded credentials, query parameters, ports, or IP addresses.' }, 400);
       const id = crypto.randomUUID();
       const ts = nowISO();
-      await env.DB.prepare('INSERT INTO projects(id,user_id,name,source_type,repository_url,python_version,build_command,start_command,status,is_sample,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
-        .bind(id, userId, name, 'git', repositoryUrl, String(pythonVersion), buildCommand, startCommand, 'stopped', 0, ts, ts).run();
+      await env.DB.prepare('INSERT INTO projects(id,user_id,name,source_type,repository_url,python_version,build_command,start_command,status,is_sample,created_at,updated_at,parent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .bind(id, userId, name, 'git', repositoryUrl, String(pythonVersion), buildCommand, startCommand, 'stopped', 0, ts, ts, parentGroup ? parentGroup.id : null).run();
       await addActivity(env, userId, id, 'project_created', `${name} was connected to Git.`);
       return json({ project: await projectView(env, await ownerProject(env, userId, id)) }, 201);
     }
@@ -1205,8 +1233,8 @@ async function handle(request, env, method, path, url, ip, ctx) {
     const id = crypto.randomUUID();
     const ts = nowISO();
     const bundleId = await storeBundle(env, bytes);
-    await env.DB.prepare('INSERT INTO projects(id,user_id,name,source_type,source_bundle,python_version,build_command,start_command,status,is_sample,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
-      .bind(id, userId, name, 'zip', bundleId, String(pythonVersion), buildCommand, startCommand, 'stopped', 0, ts, ts).run();
+    await env.DB.prepare('INSERT INTO projects(id,user_id,name,source_type,source_bundle,python_version,build_command,start_command,status,is_sample,created_at,updated_at,parent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .bind(id, userId, name, 'zip', bundleId, String(pythonVersion), buildCommand, startCommand, 'stopped', 0, ts, ts, parentGroup ? parentGroup.id : null).run();
     await addActivity(env, userId, id, 'project_created', `${name} was created from a ZIP upload.`);
     return json({ project: await projectView(env, await ownerProject(env, userId, id)) }, 201);
   }
@@ -1219,7 +1247,8 @@ async function handle(request, env, method, path, url, ip, ctx) {
     if (method === 'GET') {
       p = await sweepStaleDeploy(env, p);
       let view = p;
-      try {
+      if (p.source_type === 'group') view = { ...p, status: 'stopped' };
+      else try {
         const measured = await workerRequest(env, `/v1/projects/${p.id}/status`, {}, 15000);
         if (p.status !== 'deploying' && measured.status && ['online', 'stopped', 'failed', 'unknown'].includes(measured.status)) {
           await env.DB.prepare("UPDATE projects SET status=? WHERE id=? AND status <> 'deploying'").bind(measured.status, p.id).run();
@@ -1232,7 +1261,13 @@ async function handle(request, env, method, path, url, ip, ctx) {
       }
       const latest = await first(env.DB.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC LIMIT 1').bind(p.id));
       const deployments = await rows(env.DB.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC').bind(p.id));
-      return json({ project: await projectView(env, view), environment: await envView(env, p.id), latestDeployment: latest ? deploymentView(latest) : null, deployments: deployments.map(deploymentView), runtimeMode: 'worker' });
+      let bots = null;
+      if (p.source_type === 'group') {
+        bots = [];
+        const kids = await rows(env.DB.prepare('SELECT * FROM projects WHERE parent_id=? ORDER BY created_at ASC').bind(p.id));
+        for (const k of kids) bots.push(await liveProjectView(env, k));
+      }
+      return json({ project: await projectView(env, view), bots, environment: await envView(env, p.id), latestDeployment: latest ? deploymentView(latest) : null, deployments: deployments.map(deploymentView), runtimeMode: 'worker' });
     }
 
     if (method === 'PATCH') {
@@ -1256,6 +1291,22 @@ async function handle(request, env, method, path, url, ip, ctx) {
       checkCsrf();
       projectOperations.add(p.id);
       try {
+        if (p.source_type === 'group') {
+          const children = await rows(env.DB.prepare('SELECT * FROM projects WHERE parent_id=?').bind(p.id));
+          for (const child of children) {
+            if (projectOperations.has(child.id)) continue;
+            projectOperations.add(child.id);
+            try {
+              try { await workerRequest(env, `/v1/projects/${child.id}/action`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'delete' }) }); } catch {}
+              await env.DB.prepare("UPDATE deployments SET status='failed',summary='Deployment canceled: the project was deleted.',finished_at=?,duration_ms=0 WHERE project_id=? AND status='building'").bind(nowISO(), child.id).run();
+              await deleteBundle(env, child.source_bundle);
+              await env.DB.prepare('DELETE FROM projects WHERE id=?').bind(child.id).run();
+            } finally { projectOperations.delete(child.id); }
+          }
+          await env.DB.prepare('DELETE FROM projects WHERE id=?').bind(p.id).run();
+          await addActivity(env, userId, null, 'project_deleted', `${p.name} and its bots were deleted.`);
+          return json({ ok: true });
+        }
         const deleteResult = await workerRequest(env, `/v1/projects/${p.id}/action`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'delete' }) });
         await env.DB.prepare("UPDATE deployments SET status='failed',summary='Deployment canceled: the project was deleted.',finished_at=?,duration_ms=0 WHERE project_id=? AND status='building'").bind(nowISO(), p.id).run();
         await addActivity(env, userId, null, 'project_deleted', `${p.name} was deleted.${deleteResult && deleteResult.wasRunning ? ' Its running bot process was stopped.' : ''}`);
@@ -1396,6 +1447,7 @@ async function handle(request, env, method, path, url, ip, ctx) {
     let p = await ownerProject(env, userId, segments[1]);
     if (!p) return json({ error: 'Project not found.' }, 404);
     p = await sweepStaleDeploy(env, p);
+    if (p.source_type === 'group') return json({ error: 'This project is a container. Deploy its bots from the project page instead.' }, 400);
     if (p.status === 'deploying' || projectOperations.has(p.id)) return json({ error: 'Another operation is already in progress for this project.' }, 409);
     const started = Date.now();
     const deployment = await addDeploy(env, p.id, 'building', 'Deployment is being prepared.');
@@ -1456,6 +1508,7 @@ async function handle(request, env, method, path, url, ip, ctx) {
     if (p.status === 'deploying' || projectOperations.has(p.id)) return json({ error: 'Project actions are unavailable while another operation is running.' }, 409);
     const body = await readJson(request);
     const action = body.action;
+    if (p.source_type === 'group') return json({ error: 'This project is a container. Manage its bots from the project page instead.' }, 400);
     if (!['start', 'stop', 'restart', 'redeploy'].includes(action)) return json({ error: 'Unsupported project action.' }, 400);
     if (action === 'redeploy') {
       return new Response(null, { status: 307, headers: { location: `/api/projects/${p.id}/deploy` } });
