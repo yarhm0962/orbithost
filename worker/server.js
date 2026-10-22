@@ -493,19 +493,21 @@ function spawnBot(id,secrets,deploymentId){
     try{logger.line(`[OrbitHost worker] Process exited with ${code===null?`signal ${signal}`:`exit code ${code}`}.`);logger.end()}catch{}
     if(entry.stopRequested)return;
     const crashed=code===null?Boolean(signal):code!==0;
-    if(!crashed)return;
     const fatalLine=lastFatal&&Date.now()-lastFatal.at<=15000?lastFatal.line.slice(0,240):'';
+    let autoStartOff=false;
     try{
       const meta=readMeta(id);
       if(meta&&meta.startCommand&&uptimeSec<3000){
         const n=(Number(meta.consecutiveFastExits)||0)+1;
         if(n>=3){
           writeMeta(id,{...meta,autoStart:false,consecutiveFastExits:n});
+          autoStartOff=true;
           const dis=runtimeLogger(id,getSecrets(id));
-          dis.line('[OrbitHost worker] Auto-start disabled after three consecutive immediate exits. Fix the startup error in the logs, then start the project manually.');dis.end();
+          dis.line('[OrbitHost worker] Auto-start disabled after three consecutive early exits. Fix the startup error in the logs, then start the project manually.');dis.end();
         }else writeMeta(id,{...meta,consecutiveFastExits:n});
       }else if(meta&&meta.startCommand&&uptimeSec>=60000&&meta.consecutiveFastExits){writeMeta(id,{...meta,consecutiveFastExits:0})}
     }catch{}
+    if(!entry.memoryKilled&&!autoStartOff)scheduleAutoRestart(id,{uptimeSec});
     if(entry.memoryKilled){try{const meta=readMeta(id);if(meta)writeMeta(id,{...meta,autoStart:false});const dis=runtimeLogger(id,getSecrets(id));dis.line('[OrbitHost worker] Auto-start disabled after the memory limit was hit. Fix the memory usage, then start the project manually.');dis.end()}catch{}}
     reportProcessExit(id,{projectId:id,exitCode:code===null?null:code,signal:signal||'',uptimeSec,deploymentId:entry.deploymentId||'',fatalLine,reasonCode:entry.memoryKilled?'memory_limit':'',memoryKilledMb:entry.memoryKilled?entry.memoryKilled.mb:null,memoryLimitMb:entry.memoryKilled?entry.memoryKilled.limitMb:null});
   });
@@ -542,6 +544,7 @@ async function killProjectStragglers(id){
 }
 async function deployProcess(body,file){
   const id=String(body.projectId||'');if(!validId(id))throw new Error('Invalid project ID.');
+  cancelAutoRestart(id);
   deployBuildFatals.set(id,[]);
   const version=String(body.pythonVersion||'3.12');if(!VERSIONS.has(version))throw new Error('Unsupported Python version.');
   const buildCommand=String(body.buildCommand||'').slice(0,500);let startCommand=String(body.startCommand||'python main.py').trim().slice(0,500);
@@ -616,6 +619,7 @@ async function containerActionProcess(id,action){
   const secrets=getSecrets(id);
   if(action==='delete'){
     deletedProjects.add(id);
+    cancelAutoRestart(id);
     const wasRunning=procs.has(id);
     await stopProcess(id,6000).catch(()=>{});
     procs.delete(id);
@@ -628,6 +632,7 @@ async function containerActionProcess(id,action){
     return {status:'deleted',wasRunning,killed:stragglers||0};
   }
   if(!['start','stop','restart'].includes(action))throw new Error('Unsupported action.');
+  cancelAutoRestart(id);
   if(action==='stop'){await stopProcess(id);const meta=readMeta(id);if(meta)writeMeta(id,{...meta,autoStart:false});return {status:'stopped'}}
   const meta=readMeta(id);
   if(!meta||!meta.startCommand)throw new Error('No start command recorded for this project. Deploy it first.');
@@ -919,6 +924,32 @@ async function restoreFromControlPlane(){
 const activeDeploys=new Set();
 const deletedProjects=new Set();
 const restartBackoff=new Map();
+const autoRestartTimers=new Map();
+function cancelAutoRestart(id){const t=autoRestartTimers.get(id);if(t){clearTimeout(t);autoRestartTimers.delete(id)}}
+// Bring the bot back on its own after an unexpected exit: quick first retry,
+// then exponential backoff (30s doubling, 10 min cap). Explicit stops, memory
+// kills, crash-loop auto-disable, deletes, and active deploys never restart.
+function scheduleAutoRestart(id,info={}){
+  if(autoRestartTimers.has(id))return;
+  try{
+    if(deletedProjects.has(id)||activeDeploys.has(id))return;
+    const meta=readMeta(id);
+    if(!meta||!meta.startCommand||meta.autoStart===false)return;
+    if(info.uptimeSec>=600)restartBackoff.delete(id);
+    const back=restartBackoff.get(id)||{n:0,lastAt:0};
+    const delayMs=Math.min(30000*Math.pow(2,back.n),600000);
+    restartBackoff.set(id,{n:back.n+1,lastAt:Date.now()});
+    try{const lg=runtimeLogger(id,getSecrets(id));lg.line(`[OrbitHost worker] The bot stopped unexpectedly; restarting it automatically in ${Math.round(delayMs/1000)}s (recovery attempt ${back.n+1}).`);lg.end()}catch{}
+    const t=setTimeout(()=>{autoRestartTimers.delete(id);void (async()=>{
+      if(deletedProjects.has(id)||activeDeploys.has(id))return;
+      if(procs.has(id))return;
+      const m2=readMeta(id);if(!m2||!m2.startCommand||m2.autoStart===false)return;
+      try{await spawnBot(id,getSecrets(id))}catch(e){try{const l2=runtimeLogger(id,getSecrets(id));l2.line(`[OrbitHost worker] Auto-restart failed: ${e.message}. The watchdog will keep trying.`);l2.end()}catch{}}
+    })()},delayMs);
+    t.unref?.();
+    autoRestartTimers.set(id,t);
+  }catch{}
+}
 const watchdogState={sweeps:0,lastSweepAt:null,restarts:[]};
 async function watchdogSweep(){
   watchdogState.sweeps++;watchdogState.lastSweepAt=new Date().toISOString();
