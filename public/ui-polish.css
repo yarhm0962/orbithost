@@ -580,3 +580,12 @@ html.overlay-locked, body.overlay-locked { overflow: hidden !important; }
   user-select: none;
   -webkit-touch-callout: none;
 }
+
+/* GitHub sign-in */
+.auth-divider{display:flex;align-items:center;gap:12px;margin:18px 0 4px;color:#7e8ba7;font-size:10px;letter-spacing:1.1px;text-transform:uppercase}
+.auth-divider:before,.auth-divider:after{content:"";height:1px;flex:1;background:#2e3950}
+.button-github{width:100%;min-height:48px;display:inline-flex;align-items:center;justify-content:center;gap:10px;margin-top:12px;border:1px solid #3a4965;background:#131b2c;color:#eef2fa;font-size:13px;font-weight:700}
+.button-github:hover{background:#1a2438;border-color:#4b5c7e}
+.button-github .icon{width:18px;height:18px}
+.github-hint{margin-top:10px;font-size:11px;color:#8794ad;line-height:1.6;text-align:center}
+.github-error{margin-bottom:14px;border:1px solid rgba(255,125,139,.28);background:var(--red-soft);color:#ffabb5;padding:11px 13px;border-radius:10px;font-size:12px;line-height:1.55}

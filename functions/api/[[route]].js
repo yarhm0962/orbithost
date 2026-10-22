@@ -361,13 +361,30 @@ let schemaPromise = null;
 function ensureSchema(env) {
   if (!schemaPromise) {
     schemaPromise = env.DB.exec(DDL).then(async () => {
-      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT', 'ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0']) {
+      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT', 'ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0', 'ALTER TABLE users ADD COLUMN github_id INTEGER', "ALTER TABLE users ADD COLUMN provider TEXT NOT NULL DEFAULT 'password'", 'ALTER TABLE users ADD COLUMN github_token TEXT']) {
         try { await env.DB.prepare(statement).run(); } catch (migrationError) { if (!/duplicate column name|already exists/i.test(String(migrationError && migrationError.message || ''))) throw migrationError; }
       }
       await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users(username_lower)').run();
+      await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS users_github_id ON users(github_id)').run();
+      await env.DB.prepare('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)').run();
     }).catch((error) => { schemaPromise = null; throw error; });
   }
   return schemaPromise;
+}
+
+// --- GitHub sign-in credentials: env vars first, then the app_settings table filled by the one-click setup page ---
+
+async function githubCreds(env) {
+  if (env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET) return { clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET };
+  try {
+    await ensureSchema(env);
+    const idRow = await first(env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('github_client_id'));
+    const secRow = await first(env.DB.prepare('SELECT value FROM app_settings WHERE key = ?').bind('github_client_secret'));
+    if (!idRow || !secRow) return null;
+    const key = await aesKey(env);
+    if (!key) return null;
+    return { clientId: String(idRow.value), clientSecret: await decryptText(String(secRow.value), key) };
+  } catch { return null; }
 }
 
 // --- row helpers ---
@@ -435,7 +452,7 @@ async function issueVerificationCode(env, email, username) {
   const sent = await sendVerificationEmail(env, email, code, username);
   return { sent: sent.ok, error: sent.error };
 }
-function publicUser(row) { return { id: row.id, email: row.email, username: row.username || null, createdAt: row.created_at }; }
+function publicUser(row) { return { id: row.id, email: row.email, username: row.username || null, createdAt: row.created_at, provider: row.provider || 'password', github: row.github_id != null }; }
 
 async function ownerProject(env, userId, projectId) {
   return first(env.DB.prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?').bind(projectId, userId));
@@ -566,7 +583,8 @@ async function handle(request, env, method, path, url, ip) {
         workerReady = probe.ok;
       } catch {}
     }
-    return json({ hostingMode: 'worker', isPrototype: false, workerReady, maxUploadMb: MAX_UPLOAD_MB, pythonVersions: PYTHON_VERSIONS });
+    const gh = await githubCreds(env);
+    return json({ hostingMode: 'worker', isPrototype: false, workerReady, maxUploadMb: MAX_UPLOAD_MB, pythonVersions: PYTHON_VERSIONS, githubEnabled: Boolean(gh) });
   }
 
   // ---- session plumbing ----
@@ -593,7 +611,7 @@ async function handle(request, env, method, path, url, ip) {
   }
   if (method === 'GET' && path === '/auth/me') {
     if (!session?.u) return json({ user: null });
-    const user = await first(env.DB.prepare('SELECT id,email,created_at FROM users WHERE id = ?').bind(session.u));
+    const user = await first(env.DB.prepare('SELECT id,email,created_at,provider,github_id FROM users WHERE id = ?').bind(session.u));
     if (!user) return json({ user: null }, 200, { 'set-cookie': await clearSessionCookie() });
     return json({ user: publicUser(user) });
   }
@@ -765,6 +783,118 @@ async function handle(request, env, method, path, url, ip) {
     const usernameError = validateUsername(username);
     if (usernameError) return json({ error: usernameError }, 400);
     if (await first(env.DB.prepare('SELECT 1 FROM users WHERE username_lower = ?').bind(username.toLowerCase()))) return json({ error: 'That username is already taken.' }, 409);
+    return json({ ok: true });
+  }
+
+  // ---- GitHub sign-in (OAuth user flow; auto-creates the account on first sign-in) ----
+
+  if (path === '/auth/github/start' && method === 'GET') {
+    const gh = await githubCreds(env);
+    const params = new URL(request.url).searchParams;
+    const mode = params.get('connect') === '1' && session?.u ? 'connect' : 'login';
+    if (!gh) return new Response(null, { status: 302, headers: { location: '/?authError=github_unavailable' } });
+    const origin = new URL(request.url).origin;
+    const authorize = new URL('https://github.com/login/oauth/authorize');
+    authorize.searchParams.set('client_id', gh.clientId);
+    authorize.searchParams.set('redirect_uri', `${origin}/api/auth/github/callback`);
+    authorize.searchParams.set('scope', 'read:user user:email');
+    authorize.searchParams.set('state', `${bytesToB64url(crypto.getRandomValues(new Uint8Array(24)))}.${mode}`);
+    return new Response(null, { status: 302, headers: { location: authorize.toString(), 'set-cookie': `gh_oauth_state=${authorize.searchParams.get('state')}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600` } });
+  }
+
+  if (path === '/auth/github/callback' && method === 'GET') {
+    const land = (reason) => { const h = new Headers({ location: `/?authError=${reason}` }); h.append('set-cookie', 'gh_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'); return new Response(null, { status: 302, headers: h }); };
+    const url = new URL(request.url);
+    const code = url.searchParams.get('code') || '';
+    const state = url.searchParams.get('state') || '';
+    const cookieState = parseCookies(request).gh_oauth_state || '';
+    if (url.searchParams.get('error')) return land('github_denied');
+    const gh = await githubCreds(env);
+    if (!gh) return land('github_unavailable');
+    if (!code || !state || state !== cookieState) return land('github_expired');
+    const mode = state.endsWith('.connect') && session?.u ? 'connect' : 'login';
+    const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+    await authRateLimit(env, ip);
+    let accessToken = '';
+    try {
+      const tokenRes = await fetch('https://github.com/login/oauth/access_token', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify({ client_id: gh.clientId, client_secret: gh.clientSecret, code, redirect_uri: `${url.origin}/api/auth/github/callback` }) });
+      const tokenJson = await tokenRes.json();
+      if (tokenRes.ok && tokenJson && tokenJson.access_token) accessToken = String(tokenJson.access_token);
+    } catch {}
+    if (!accessToken) return land('github_failed');
+    const ghHeaders = { authorization: `Bearer ${accessToken}`, accept: 'application/vnd.github+json', 'user-agent': 'OrbitHost' };
+    let ghUser = null; let ghEmails = [];
+    try { ghUser = await (await fetch('https://api.github.com/user', { headers: ghHeaders })).json(); } catch {}
+    try { const eRes = await fetch('https://api.github.com/user/emails', { headers: ghHeaders }); if (eRes.ok) ghEmails = await eRes.json(); } catch {}
+    if (!ghUser || !ghUser.id) return land('github_failed');
+    const ghId = Number(ghUser.id);
+    const verifiedEmails = (Array.isArray(ghEmails) ? ghEmails : []).filter((e) => e && e.verified && e.email);
+    const chosen = verifiedEmails.find((e) => e.primary) || verifiedEmails[0] || null;
+    if (!chosen) return land('github_no_email');
+    const email = String(chosen.email).toLowerCase();
+    let tokenCell = null;
+    try { const key = await aesKey(env); if (key) tokenCell = await encryptText(accessToken, key); } catch {}
+    if (mode === 'connect') {
+      const conflict = await first(env.DB.prepare('SELECT id FROM users WHERE github_id = ? AND id != ?').bind(ghId, session.u));
+      if (conflict) return land('github_conflict');
+      await env.DB.prepare('UPDATE users SET github_id = ?, github_token = ? WHERE id = ?').bind(ghId, tokenCell, session.u).run();
+      const h = new Headers({ location: '/?ghConnected=1' });
+      h.append('set-cookie', 'gh_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0');
+      return new Response(null, { status: 302, headers: h });
+    }
+    let user = await first(env.DB.prepare('SELECT * FROM users WHERE github_id = ?').bind(ghId));
+    if (!user) user = await first(env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email));
+    if (user) {
+      await env.DB.prepare('UPDATE users SET github_id = ?, github_token = ?, email_verified = CASE WHEN ? THEN 1 ELSE email_verified END WHERE id = ?').bind(ghId, tokenCell, chosen.verified ? 1 : 0, user.id).run();
+      user = await first(env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id));
+    } else {
+      let base = String(ghUser.login || '').toLowerCase().replace(/-/g, '.').replace(/[^a-z0-9.]/g, '').replace(/\.{2,}/g, '.').replace(/^\.+|\.+$/g, '').slice(0, 18);
+      if (!/^[a-z0-9]/.test(base)) base = `u${base}`;
+      let username = base.length >= 3 ? base : 'ghuser';
+      for (let n = 1; n <= 60; n += 1) {
+        const taken = await first(env.DB.prepare('SELECT 1 FROM users WHERE username_lower = ?').bind(username.toLowerCase()));
+        if (!taken) break;
+        username = `${base || 'ghuser'}${n + 1}`.slice(0, 20);
+      }
+      const usernameError = validateUsername(username);
+      if (usernameError) return land('github_username');
+      user = { id: crypto.randomUUID(), created_at: nowISO() };
+      await env.DB.prepare('INSERT INTO users(id,email,username,username_lower,password_hash,email_verified,github_id,provider,created_at) VALUES(?,?,?,?,?,?,?,\'github\',?)')
+        .bind(user.id, email, username, username.toLowerCase(), `oauth-${bytesToB64url(crypto.getRandomValues(new Uint8Array(24)))}`, chosen.verified ? 1 : 0, ghId, user.created_at).run();
+      user = await first(env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(user.id));
+    }
+    if (!user) return land('github_failed');
+    if (!user.email_verified && !chosen.verified) return land('github_unverified');
+    const sessionData = { u: user.id, c: bytesToB64url(crypto.getRandomValues(new Uint8Array(32))), e: Date.now() + SESSION_TTL_MS };
+    const headers = new Headers({ location: '/' });
+    headers.append('set-cookie', await writeSession(env, sessionData));
+    headers.append('set-cookie', 'gh_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0');
+    return new Response(null, { status: 302, headers });
+  }
+
+  if (path === '/auth/github/repos' && method === 'GET') {
+    const userId = requireAuth();
+    const row = await first(env.DB.prepare('SELECT github_token, github_id FROM users WHERE id = ?').bind(userId));
+    if (!row || row.github_id == null) return json({ connected: false, repos: [] });
+    let token = '';
+    try { const key = await aesKey(env); if (key && row.github_token) token = await decryptText(String(row.github_token), key); } catch {}
+    if (!token) return json({ connected: true, repos: [] });
+    try {
+      const res = await fetch('https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member', { headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'OrbitHost' }, signal: AbortSignal.timeout(8000) });
+      if (!res.ok) return json({ connected: true, repos: [] });
+      const list = await res.json();
+      const repos = (Array.isArray(list) ? list : []).map((r) => ({ name: r.full_name || r.name, cloneUrl: r.clone_url || '', private: Boolean(r.private), updatedAt: r.updated_at || '', description: r.description || '' }));
+      return json({ connected: true, repos });
+    } catch { return json({ connected: true, repos: [] }); }
+  }
+
+  if (path === '/auth/github/disconnect' && method === 'POST') {
+    const userId = requireAuth();
+    checkCsrf();
+    const row = await first(env.DB.prepare('SELECT provider, password_hash FROM users WHERE id = ?').bind(userId));
+    if (!row) fail(404, 'Account not found.');
+    if (row.provider === 'github' && !String(row.password_hash || '').startsWith('pbkdf2$')) fail(409, 'This account signs in with GitHub only, so GitHub cannot be disconnected. Add a password sign-in first.');
+    await env.DB.prepare('UPDATE users SET github_id = NULL, github_token = NULL WHERE id = ?').bind(userId).run();
     return json({ ok: true });
   }
 
