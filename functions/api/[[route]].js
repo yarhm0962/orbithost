@@ -357,6 +357,52 @@ async function deployWithWorker(env, p, deploymentId) {
   return workerRequest(env, `/v1/projects/${p.id}/deploy`, { method: 'POST', body: form });
 }
 
+async function autoDeployProject(env, p) {
+  if (p.status === 'deploying' || projectOperations.has(p.id)) return { skipped: true };
+  const userId = p.user_id;
+  const started = Date.now();
+  const deployment = await addDeploy(env, p.id, 'building', 'Automatic deploy from a repository push.', 'auto');
+  await env.DB.prepare('UPDATE projects SET status=?,updated_at=? WHERE id=?').bind('deploying', nowISO(), p.id).run();
+  await addActivity(env, userId, p.id, 'deployment_started', `${p.name} automatic deployment started.`);
+  projectOperations.add(p.id);
+  const deployTimeoutMs = Math.max(60000, Number(env.DEPLOY_TIMEOUT_MS || 30 * 60 * 1000));
+  let deployTimer;
+  try {
+    await Promise.race([
+      deployWithWorker(env, p, deployment.id),
+      new Promise((_, reject) => { deployTimer = setTimeout(() => reject(new ApiError(504, 'Deployment timed out: the worker stopped responding.')), deployTimeoutMs); })
+    ]);
+    if (deployTimer) clearTimeout(deployTimer);
+    const still = await first(env.DB.prepare('SELECT id FROM projects WHERE id=?').bind(p.id));
+    if (!still) return { done: true };
+    let runtimeStatus = 'unknown';
+    try {
+      const measured = await workerRequest(env, `/v1/projects/${p.id}/status`, {}, 15000);
+      if (['online', 'stopped', 'failed', 'unknown'].includes(measured.status)) runtimeStatus = measured.status;
+    } catch {}
+    const duration = Date.now() - started;
+    const summary = runtimeStatus === 'online' ? 'Automatic deploy completed; process is running.'
+      : runtimeStatus === 'stopped' ? 'Automatic deploy completed, but the process is not running. Inspect runtime logs.'
+      : 'Automatic deploy completed; runtime status could not be confirmed.';
+    await env.DB.prepare("UPDATE deployments SET status='success',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+      .bind(summary, nowISO(), duration, deployment.id).run();
+    await env.DB.prepare('UPDATE projects SET status=?,updated_at=?,last_deployed_at=? WHERE id=?').bind(runtimeStatus, nowISO(), nowISO(), p.id).run();
+    await addActivity(env, userId, p.id, 'deployment_succeeded', `${p.name} automatic deployment completed; runtime status is ${runtimeStatus}.`);
+    return { done: true, runtimeStatus };
+  } catch (error) {
+    const gone = await first(env.DB.prepare('SELECT id FROM projects WHERE id=?').bind(p.id));
+    if (!gone) return { done: true };
+    const duration = Date.now() - started;
+    const aes = await aesKey(env);
+    const secrets = aes ? (await readEnv(env, p.id, aes)).map((x) => x.value) : [];
+    await env.DB.prepare("UPDATE deployments SET status='failed',summary=?,finished_at=?,duration_ms=? WHERE id=? AND status='building'")
+      .bind(maskSecrets(error && error.message ? error.message : 'Automatic deployment failed.', secrets), nowISO(), duration, deployment.id).run();
+    await env.DB.prepare('UPDATE projects SET status=?,updated_at=? WHERE id=?').bind('failed', nowISO(), p.id).run();
+    await addActivity(env, userId, p.id, 'deployment_failed', `${p.name} automatic deployment failed.`);
+    return { done: true, failed: true };
+  } finally { projectOperations.delete(p.id); }
+}
+
 // --- schema ---
 
 const DDL = `
@@ -373,13 +419,14 @@ CREATE INDEX IF NOT EXISTS activity_by_user ON activities(user_id, id DESC);
 CREATE TABLE IF NOT EXISTS bundles (bundle_id TEXT NOT NULL, seq INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(bundle_id, seq));
 CREATE TABLE IF NOT EXISTS rate_limits (ip TEXT NOT NULL, route TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(ip, route));
 CREATE TABLE IF NOT EXISTS email_verifications (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_sent_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS git_hooks (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, repo_slug TEXT NOT NULL, secret TEXT NOT NULL, github_hook_id INTEGER, created_at TEXT NOT NULL, UNIQUE(user_id, repo_slug));
 `;
 
 let schemaPromise = null;
 function ensureSchema(env) {
   if (!schemaPromise) {
     schemaPromise = env.DB.exec(DDL).then(async () => {
-      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT', 'ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0', 'ALTER TABLE users ADD COLUMN github_id INTEGER', "ALTER TABLE users ADD COLUMN provider TEXT NOT NULL DEFAULT 'password'", 'ALTER TABLE users ADD COLUMN github_token TEXT', 'ALTER TABLE users ADD COLUMN github_login TEXT', 'ALTER TABLE users ADD COLUMN avatar_url TEXT']) {
+      for (const statement of ['ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN username_lower TEXT', 'ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0', 'ALTER TABLE users ADD COLUMN github_id INTEGER', "ALTER TABLE users ADD COLUMN provider TEXT NOT NULL DEFAULT 'password'", 'ALTER TABLE users ADD COLUMN github_token TEXT', 'ALTER TABLE users ADD COLUMN github_login TEXT', 'ALTER TABLE users ADD COLUMN avatar_url TEXT', 'ALTER TABLE projects ADD COLUMN auto_deploy INTEGER NOT NULL DEFAULT 0']) {
         try { await env.DB.prepare(statement).run(); } catch (migrationError) { if (!/duplicate column name|already exists/i.test(String(migrationError && migrationError.message || ''))) throw migrationError; }
       }
       await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users(username_lower)').run();
@@ -484,7 +531,7 @@ async function projectView(env, p) {
     pythonVersion: p.python_version, buildCommand: p.build_command, startCommand: p.start_command,
     status: p.status, isSample: false, createdAt: p.created_at, updatedAt: p.updated_at,
     lastDeployedAt: p.last_deployed_at, environmentCount: envCount, deploymentCount: deployCount,
-    runtimeMode: 'container'
+    autoDeploy: !!p.auto_deploy, runtimeMode: 'container'
   };
 }
 
@@ -568,14 +615,14 @@ async function readJson(request) {
 
 // --- main handler ---
 
-export async function onRequest({ request, env }) {
+export async function onRequest({ request, env, ctx }) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/^\/api/, '') || '/';
   const method = request.method.toUpperCase();
   const ip = request.headers.get('cf-connecting-ip') || 'unknown';
   try {
     await ensureSchema(env);
-    return await handle(request, env, method, path, url, ip);
+    return await handle(request, env, method, path, url, ip, ctx);
   } catch (error) {
     if (error instanceof ApiError) return json({ error: error.message }, error.status);
     console.error(`[orbithost] ${method} ${path}:`, error && error.message ? error.message : error);
@@ -583,7 +630,7 @@ export async function onRequest({ request, env }) {
   }
 }
 
-async function handle(request, env, method, path, url, ip) {
+async function handle(request, env, method, path, url, ip, ctx) {
   const MAX_UPLOAD_MB = Math.min(100, Math.max(1, Number(env.MAX_UPLOAD_MB || 8)));
   const segments = path.split('/').filter(Boolean);
 
@@ -591,6 +638,41 @@ async function handle(request, env, method, path, url, ip) {
 
   if (method === 'GET' && path === '/health') {
     return json({ ok: true, service: 'orbithost-control-plane', mode: 'worker', time: nowISO() });
+  }
+  if (method === 'POST' && path === '/hooks/github') {
+    const event = (request.headers.get('x-github-event') || '').toLowerCase();
+    const raw = await request.text();
+    if (event !== 'push') return json({ ok: true });
+    let payload = null;
+    try { payload = JSON.parse(raw); } catch {}
+    const slug = payload && payload.repository && payload.repository.full_name ? String(payload.repository.full_name) : '';
+    if (!slug) return json({ ok: true });
+    const sig = request.headers.get('x-hub-signature-256') || '';
+    const hookRows = (await rows(env.DB.prepare('SELECT * FROM git_hooks WHERE repo_slug=?').bind(slug))) || [];
+    const enc = new TextEncoder();
+    let matched = null;
+    for (const row of hookRows) {
+      let secret = '';
+      try { const k = await aesKey(env); secret = k ? await decryptText(String(row.secret), k) : String(row.secret); } catch {}
+      if (!secret) continue;
+      try {
+        const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        const mac = await crypto.subtle.sign('HMAC', key, enc.encode(raw));
+        const hex = Array.from(new Uint8Array(mac)).map((b) => b.toString(16).padStart(2, '0')).join('');
+        if (sig === `sha256=${hex}`) { matched = row; break; }
+      } catch {}
+    }
+    if (!matched) return json({ ok: true });
+    const list = await rows(env.DB.prepare("SELECT * FROM projects WHERE user_id=? AND source_type='git' AND auto_deploy=1 AND repository_url LIKE ?").bind(matched.user_id, `%${slug}%`));
+    let triggered = 0; let skipped = 0;
+    for (let target of (list || [])) {
+      try { target = await sweepStaleDeploy(env, target); } catch {}
+      if (target.status === 'deploying' || projectOperations.has(target.id)) { skipped += 1; continue; }
+      triggered += 1;
+      const run = () => autoDeployProject(env, target).catch(() => {});
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(run()); else await run();
+    }
+    return json({ ok: true, triggered, skipped });
   }
   if (method === 'GET' && path === '/config') {
     let workerReady = false;
@@ -1234,6 +1316,78 @@ async function handle(request, env, method, path, url, ip) {
     if (!p) return json({ error: 'Project not found.' }, 404);
     const deployments = await rows(env.DB.prepare('SELECT * FROM deployments WHERE project_id=? ORDER BY sequence DESC').bind(p.id));
     return json({ deployments: deployments.map(deploymentView) });
+  }
+
+  if (segments[0] === 'projects' && segments[2] === 'auto-deploy' && method === 'POST') {
+    const userId = requireAuth();
+    checkCsrf();
+    const p = await ownerProject(env, userId, segments[1]);
+    if (!p) return json({ error: 'Project not found.' }, 404);
+    const body = await readJson(request);
+    const enabled = Boolean(body.enabled);
+    if (!enabled) {
+      await env.DB.prepare('UPDATE projects SET auto_deploy=0,updated_at=? WHERE id=?').bind(nowISO(), p.id).run();
+      return json({ ok: true, enabled: false });
+    }
+    if (p.source_type !== 'git' || !p.repository_url) return json({ error: 'Automatic deploys need a Git repository source.' }, 400);
+    const m = p.repository_url.match(/^https:\/\/github\.com\/([^\/]+)\/([^\/#?]+)/i);
+    if (!m) return json({ error: 'Automatic deploys currently support GitHub repositories only.' }, 400);
+    const slug = `${m[1]}/${m[2]}`.replace(/\.git$/, '');
+    const urow = await first(env.DB.prepare('SELECT github_token FROM users WHERE id = ?').bind(userId));
+    let token = '';
+    try { const k = await aesKey(env); if (k && urow && urow.github_token) token = await decryptText(String(urow.github_token), k); } catch {}
+    let hook = await first(env.DB.prepare('SELECT * FROM git_hooks WHERE user_id=? AND repo_slug=?').bind(userId, slug));
+    if (!hook) {
+      const secretValue = bytesToB64url(crypto.getRandomValues(new Uint8Array(32)));
+      const k = await aesKey(env);
+      const cell = k ? await encryptText(secretValue, k) : secretValue;
+      const hookId = crypto.randomUUID();
+      await env.DB.prepare('INSERT INTO git_hooks(id,user_id,repo_slug,secret,created_at) VALUES(?,?,?,?,?)').bind(hookId, userId, slug, cell, nowISO()).run();
+      hook = await first(env.DB.prepare('SELECT * FROM git_hooks WHERE id=?').bind(hookId));
+    }
+    let secret = '';
+    try { const k = await aesKey(env); secret = k ? await decryptText(String(hook.secret), k) : String(hook.secret); } catch {}
+    let connected = hook.github_hook_id != null;
+    if (!connected && token) {
+      try {
+        const res = await fetch(`https://api.github.com/repos/${slug}/hooks`, { method: 'POST', headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'content-type': 'application/json', 'user-agent': 'OrbitHost' }, body: JSON.stringify({ name: 'web', active: true, events: ['push'], config: { url: `${url.origin}/api/hooks/github`, content_type: 'json', secret } }), signal: AbortSignal.timeout(10000) });
+        if (res.status === 201) {
+          const created = await res.json();
+          await env.DB.prepare('UPDATE git_hooks SET github_hook_id=? WHERE id=?').bind(Number(created.id), hook.id).run();
+          connected = true;
+        } else if (res.status === 422) {
+          try {
+            const lr = await fetch(`https://api.github.com/repos/${slug}/hooks`, { headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'OrbitHost' }, signal: AbortSignal.timeout(10000) });
+            if (lr.ok) {
+              const existing = await lr.json();
+              const mine = (Array.isArray(existing) ? existing : []).find((h) => h && h.config && String(h.config.url || '').includes('/api/hooks/github'));
+              if (mine) { await env.DB.prepare('UPDATE git_hooks SET github_hook_id=? WHERE id=?').bind(Number(mine.id), hook.id).run(); connected = true; }
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+    await env.DB.prepare('UPDATE projects SET auto_deploy=1,updated_at=? WHERE id=?').bind(nowISO(), p.id).run();
+    return json({ ok: true, enabled: true, connected, hookUrl: `${url.origin}/api/hooks/github`, secret });
+  }
+
+  if (segments[0] === 'projects' && segments[2] === 'auto-deploy' && method === 'GET') {
+    const userId = requireAuth();
+    const p = await ownerProject(env, userId, segments[1]);
+    if (!p) return json({ error: 'Project not found.' }, 404);
+    const out = { enabled: Boolean(p.auto_deploy), hookUrl: `${url.origin}/api/hooks/github`, secret: null, connected: false };
+    if (out.enabled) {
+      const m2 = p.repository_url ? p.repository_url.match(/^https:\/\/github\.com\/([^\/]+)\/([^\/#?]+)/i) : null;
+      if (m2) {
+        const slug2 = `${m2[1]}/${m2[2]}`.replace(/\.git$/, '');
+        const hook2 = await first(env.DB.prepare('SELECT * FROM git_hooks WHERE user_id=? AND repo_slug=?').bind(userId, slug2));
+        if (hook2) {
+          out.connected = hook2.github_hook_id != null;
+          try { const k = await aesKey(env); out.secret = k ? await decryptText(String(hook2.secret), k) : String(hook2.secret); } catch {}
+        }
+      }
+    }
+    return json(out);
   }
 
   if (segments[0] === 'projects' && segments[2] === 'deploy' && method === 'POST') {
