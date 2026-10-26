@@ -224,7 +224,13 @@ async function workerRequest(env, route, options = {}, timeoutMs = Number(env.WO
     const response = await fetch(`${base}${route}`, { ...options, signal: controller.signal, headers: { authorization: `Bearer ${env.WORKER_TOKEN}`, ...(options.headers || {}) } });
     const raw = await response.text();
     let data; try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
-    if (!response.ok) throw new ApiError(502, data.error || `Worker returned ${response.status}.`);
+    if (!response.ok) {
+      const suspended = (response.status === 429 || response.status === 503) && /has been suspended/i.test(raw);
+      if (suspended) throw new ApiError(503, 'The hosting worker is offline. Render suspended the free plan\u2019s services on Oct 25 because the account ran out of its monthly free compute hours; they come back when the hours reset on Nov 1.');
+      if (response.status === 429) throw new ApiError(503, 'The hosting worker is rate limited right now. Render paused the free plan\u2019s services on Oct 25 (monthly free compute hours ran out); they come back when the hours reset on Nov 1.');
+      if (response.status === 503 && /<html/i.test(raw)) throw new ApiError(503, 'The hosting worker is starting up or temporarily unavailable. Try again in a minute.');
+      throw new ApiError(502, data.error || `Worker returned ${response.status}.`);
+    }
     return data;
   } finally { clearTimeout(timer); }
 }
