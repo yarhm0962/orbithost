@@ -283,7 +283,7 @@ function botRowHtml(b) {
 }
 function renderDetail() {
   const wrapper=state.activeProject; if(!wrapper?.project) return '<div class="empty-state">Loading project…</div>';
-  const p=wrapper.project; const tab=state.activeTab; const detailHead=`<div class="page-heading" style="align-items:center"><div class="project-hero"><button class="back-link" data-nav="projects" title="Back to projects" aria-label="Back to projects">${icon('chevronLeft')}</button><div class="project-avatar">${icon(p.sourceType==='git'?'github':'file')}</div><div style="min-width:0"><div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap"><h1 class="page-title">${esc(p.name)}</h1>${statusPill(p.status)}</div><p class="page-subtitle">Python ${p.pythonVersion} · Created ${prettyTime(p.createdAt)}</p></div></div><div class="hero-actions"><button class="button button-quiet button-sm" data-action="restart" ${(p.status==='deploying'||!p.lastDeployedAt||p.status==='failed')?'disabled':''}>${icon('rotate')} <span class="button-label">Restart</span></button>${p.status==='online'?`<button class="button button-quiet button-sm" data-action="stop">${icon('pause')} <span class="button-label">Stop</span></button>`:(p.status==='stopped'&&p.lastDeployedAt?`<button class="button button-quiet button-sm" data-action="start">${icon('play')} <span class="button-label">Start</span></button>`:'')}<button class="button button-primary button-sm" data-action="deploy" ${p.status==='deploying'?'disabled':''}>${icon('rocket')} <span class="button-label">Deploy</span></button></div></div>`;
+  const p=wrapper.project; const tab=state.activeTab; const detailHead=`<div class="page-heading" style="align-items:center"><div class="project-hero"><button class="back-link" data-nav="projects" title="Back to projects" aria-label="Back to projects">${icon('chevronLeft')}</button><div class="project-avatar">${icon(p.sourceType==='git'?'github':'file')}</div><div style="min-width:0"><div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap"><h1 class="page-title">${esc(p.name)}</h1>${statusPill(p.status)}</div><p class="page-subtitle">Python ${p.pythonVersion} · Created ${prettyTime(p.createdAt)}</p></div></div><div class="hero-actions"><button class="button button-quiet button-sm" data-action="restart" ${(p.status==='deploying'||!p.lastDeployedAt||p.status==='failed')?'disabled':''}>${icon('rotate')} <span class="button-label">Restart</span></button>${p.status==='online'?`<button class="button button-quiet button-sm" data-action="stop">${icon('pause')} <span class="button-label">Stop</span></button>`:(p.status==='stopped'&&p.lastDeployedAt?`<button class="button button-quiet button-sm" data-action="start">${icon('play')} <span class="button-label">Start</span></button>`:'')}${p.sourceType==='zip'?`<button class="button button-quiet button-sm" data-action="replace-source" ${p.status==='deploying'?'disabled':''}>${icon('upload')} <span class="button-label">Replace ZIP</span></button>`:''}<button class="button button-primary button-sm" data-action="deploy" ${p.status==='deploying'?'disabled':''}>${icon('rocket')} <span class="button-label">Deploy</span></button></div><input type="file" id="replace-zip-input" accept=".zip,application/zip" hidden></div>`;
   const tabs=[['overview','Overview','monitor'],['deployments','Deployments','rocket'],['logs','Logs','terminal'],['environment','Environment','key'],['settings','Settings','settings']];
   let body='';
   if(tab==='overview') body=renderDetailOverview(wrapper);
@@ -656,6 +656,7 @@ async function handleClick(e) {
     catch(err){showToast(err&&err.message?err.message:'Could not disconnect GitHub.','error');}
     render();return;
   }
+  if(action==='replace-source'){const input=$('#replace-zip-input');if(input){input.value='';input.click();}return;}
   if(['deploy','start','stop','restart'].includes(action)){await projectAction(action,target);return;}
 }
 async function projectAction(action,button) {
@@ -667,6 +668,18 @@ async function projectAction(action,button) {
     else result=await api(`/api/projects/${encodeURIComponent(id)}/action`,{method:'POST',body:{action}});
     await loadProjectAfterAction(result.message||`${action} completed.`);
   }catch(error){showToast(error.message,'error');await refreshProject().catch(()=>{});render();}finally{resetButton(button)}
+}
+async function handleReplaceZip(file){
+  const id=state.activeProject?.project?.id;if(!id||!file)return;
+  if(!/\.zip$/i.test(file.name))return showToast('Pick a .zip archive.','error');
+  const maxMb=Number(state.config?.maxUploadMb)||8;
+  if(file.size>maxMb*1024*1024)return showToast(`That archive is over the ${maxMb} MB upload limit.`,'error');
+  try{
+    const fd=new FormData();fd.append('bundle',file,file.name);
+    showToast('Uploading the new ZIP and deploying…');
+    await api(`/api/projects/${encodeURIComponent(id)}/deploy`,{method:'POST',body:fd});
+    await loadProjectAfterAction('New source saved. Redeploying with your new ZIP.');
+  }catch(error){showToast(error.message,'error');await refreshProject().catch(()=>{});render();}
 }
 async function confirmDelete() {
   const m=state.modal;if(!m)return;
@@ -695,6 +708,7 @@ document.addEventListener('change',e=>{
     const zip=$('#source-bundle'),url=$('#repo-url');if(zip)zip.required=!git;if(url)url.required=git;
     $$('.source-option').forEach(option=>option.classList.toggle('selected',option.contains(e.target)));
   }
+  if(e.target.id==='replace-zip-input'){if(e.target.files&&e.target.files[0])handleReplaceZip(e.target.files[0]).catch(err=>showToast(err&&err.message?err.message:'Upload failed.','error'));return;}
   if(e.target.id==='log-stream'){state.logStream=e.target.value;state.logSearch=$('#log-search')?.value||'';state.logs=[];state.logCursor=null;state.logSeen=new Set();stopLiveLogs();refreshLogs().then(()=>render());}
 });
 document.addEventListener('input',e=>{

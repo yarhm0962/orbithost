@@ -1485,6 +1485,25 @@ async function handle(request, env, method, path, url, ip, ctx) {
     p = await sweepStaleDeploy(env, p);
     if (p.kind === 'group') return json({ error: 'This project is a container. Deploy its bots from the project page instead.' }, 400);
     if (p.status === 'deploying' || projectOperations.has(p.id)) return json({ error: 'Another operation is already in progress for this project.' }, 409);
+    const uploadType = String(request.headers.get('content-type') || '');
+    if (uploadType.includes('multipart/form-data')) {
+      if (p.source_type !== 'zip' || !p.source_bundle) return json({ error: 'Only ZIP projects can have their source replaced.' }, 400);
+      let uploadForm;
+      try { uploadForm = await request.formData(); } catch { return json({ error: 'Upload request could not be processed.' }, 400); }
+      const file = uploadForm.get('bundle');
+      if (!file || typeof file === 'string') return json({ error: 'Upload a valid .zip archive.' }, 400);
+      if (!file.name || !file.name.toLowerCase().endsWith('.zip') || file.size < 4) return json({ error: 'Upload a valid .zip archive.' }, 400);
+      if (file.size > MAX_UPLOAD_MB * 1024 * 1024) return json({ error: `ZIP file exceeds the ${MAX_UPLOAD_MB} MB upload limit.` }, 413);
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) return json({ error: 'Upload a valid .zip archive.' }, 400);
+      validateZip(bytes, zipLimits(env));
+      const newBundleId = await storeBundle(env, bytes);
+      const replacedBundle = p.source_bundle;
+      await env.DB.prepare('UPDATE projects SET source_bundle=?,updated_at=? WHERE id=?').bind(newBundleId, nowISO(), p.id).run();
+      await deleteBundle(env, replacedBundle);
+      p = { ...p, source_bundle: newBundleId };
+      await addActivity(env, userId, p.id, 'source_replaced', `${p.name} source archive was replaced with a new ZIP upload.`);
+    }
     const started = Date.now();
     const deployment = await addDeploy(env, p.id, 'building', 'Deployment is being prepared.');
     await env.DB.prepare('UPDATE projects SET status=?,updated_at=? WHERE id=?').bind('deploying', nowISO(), p.id).run();
